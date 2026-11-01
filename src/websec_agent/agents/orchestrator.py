@@ -795,7 +795,7 @@ class Orchestrator:
                 f"Avoid duplicating: {', '.join(directive.get('avoid') or [])}",
                 f"Guidance: {directive.get('guidance', '')}",
             ]
-        output = self._call_agent(PentesterAgent(), task, context)
+        output = self._call_agent(PentesterAgent(), agent_task, context)
 
         with self._persist_lock:
             rework_finding_id = task.inputs.get("rework_finding_id")
@@ -1467,6 +1467,9 @@ class Orchestrator:
             evidence = None
             if finding.evidence_ids:
                 evidence = self._repos.evidence.get(finding.evidence_ids[0])
+            # Keep confirmed findings as a stable record type. Do not infer a
+            # generic "path" type from finding wording; specialized facts use
+            # only the explicit injection/credential classifications below.
             text = f"{finding.category} {finding.title}".lower()
             if "injection" in text:
                 kind = "injection_point"
