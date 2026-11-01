@@ -9,12 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .core.errors import ConfigError
 from .core.schemas import Role, RunBudget
 
-REQUIRED_ROLES: tuple[Role, ...] = (
-    Role.PLANNER,
-    Role.PENTESTER,
-    Role.REVIEWER,
-    Role.REPORTER,
-)
+REQUIRED_ROLES: tuple[Role, ...] = (Role.PENTESTER,)
 
 
 class RoleModelConfig(BaseModel):
