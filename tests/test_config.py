@@ -14,7 +14,13 @@ def _write_config(tmp_path, **overrides):
             "model": "test-model",
             "base_url": "https://model.example/v1",
             "api_key_env": "TEST_KEY",
-        }
+        },
+        "supervisor": {
+            "provider": "openai_compatible",
+            "model": "test-supervisor",
+            "base_url": "https://model.example/v1",
+            "api_key_env": "TEST_KEY",
+        },
     }
     roles.update(overrides)
     path = tmp_path / "models.yaml"
@@ -38,17 +44,18 @@ def test_empty_pentester_model_is_rejected_at_startup(tmp_path):
         load_config(path)
 
 
-def test_valid_four_pentester_config_loads_one_shared_model(tmp_path):
+def test_valid_four_pentester_config_loads_dedicated_supervisor_model(tmp_path):
     config = load_config(_write_config(tmp_path))
-    assert list(config.roles) == ["pentester"]
+    assert list(config.roles) == ["pentester", "supervisor"]
     assert config.roles["pentester"].model == "test-model"
+    assert config.roles["supervisor"].model == "test-supervisor"
     assert config.run.max_tasks == 10
 
 
 def test_missing_pentester_role_is_rejected(tmp_path):
     path = tmp_path / "models.yaml"
     path.write_text(yaml.safe_dump({"roles": {}}), encoding="utf-8")
-    with pytest.raises(ConfigError, match="missing role configuration: pentester"):
+    with pytest.raises(ConfigError, match="missing role configuration: pentester, supervisor"):
         load_config(path)
 
 
@@ -61,3 +68,12 @@ def test_scope_policy_parsing(tmp_path):
     policy = load_scope_policy(path)
     assert policy.allowed_hosts == ["*.example.com"]
     assert policy.allow_private is False
+
+
+def test_missing_supervisor_role_is_rejected(tmp_path):
+    path = _write_config(tmp_path)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["roles"].pop("supervisor")
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ConfigError, match="missing role configuration: supervisor"):
+        load_config(path)
