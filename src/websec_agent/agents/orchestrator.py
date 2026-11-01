@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ..core.budget import BudgetGuard, BudgetSnapshot
-from ..core.errors import ConfigError, ProtocolError, ScopeViolation, WebSecError
+from ..core.errors import ConfigError, ConcurrentModification, ProtocolError, ScopeViolation, WebSecError
 from ..core.schemas import (
     AuditOutput,
     Budget,
@@ -24,6 +24,7 @@ from ..core.schemas import (
     RunBudget,
     RunStatus,
     Severity,
+    SupervisorOutput,
     Task,
     TaskKind,
     TaskStatus,
@@ -43,6 +44,7 @@ from ..tools.oast import OastChannel
 from .auditor import EvidenceAuditor
 from .context import compress_evidence, compress_list
 from .pentester import PentesterAgent
+from .supervisor import SupervisorAgent
 
 ANALYSIS_KINDS = {TaskKind.ANALYZE, TaskKind.EXPLOIT, TaskKind.VALIDATE}
 ACTIVE_STATUSES = {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}
@@ -64,6 +66,7 @@ CONTEXT_CHARS_PER_TOKEN = 3.5
 CONTEXT_BUDGET_RATIO = 0.95
 CONTEXT_SAFETY_TOKENS = 4096
 MIN_CONTEXT_BUDGET_CHARS = 40_000
+MAX_SUPERVISOR_CALLS_PER_RUN = 8
 
 
 class Orchestrator:
@@ -93,6 +96,11 @@ class Orchestrator:
         self._seen_tool_requests: dict[str, set[str]] = {}
         self._probe_counts: dict[str, dict[tuple[str, str], int]] = {}
         self._persist_lock = threading.RLock()
+        self._supervisor_lock = threading.RLock()
+        self._supervisor_directives: dict[int, dict[str, Any]] = {}
+        self._supervisor_calls: dict[str, int] = {}
+        self._supervisor_disabled = False
+        self._supervisor_budget_reported = False
 
         parsed = urlparse(target)
         self._target_host = parsed.hostname or ""
@@ -141,6 +149,12 @@ class Orchestrator:
                         continue
                     break
 
+                if self._supervisor_calls.get(run.id, 0) == 0 and any(
+                    task.inputs.get("pentester_slot") for task in ready
+                ):
+                    self._maybe_supervise(run.id, "initial_assignment")
+                    ready = self._repos.tasks.list_by_status(run.id, TaskStatus.READY)
+
                 if ready[0].kind != TaskKind.REPORT:
                     reason = self._budget.exhaustion_reason()
                     if reason:
@@ -155,7 +169,13 @@ class Orchestrator:
                     if task.kind in PARALLEL_KINDS
                 ][:4]
                 if len(batch) <= 1:
-                    self._dispatch(ready[0])
+                    candidate = ready[0]
+                    self._dispatch(candidate)
+                    if candidate.kind in ANALYSIS_KINDS and candidate.inputs.get("pentester_slot"):
+                        self._maybe_supervise(
+                            run.id,
+                            f"worker_checkpoint:{candidate.inputs.get('pentester_slot')}",
+                        )
                     continue
                 self._event(
                     run.id,
@@ -170,9 +190,18 @@ class Orchestrator:
                         ],
                     },
                 )
-                futures = [pool.submit(self._dispatch, task) for task in batch]
-                for future in as_completed(futures):
+                future_tasks = {pool.submit(self._dispatch, task): task for task in batch}
+                for future in as_completed(future_tasks):
                     future.result()
+                    completed_task = future_tasks[future]
+                    if (
+                        completed_task.kind in ANALYSIS_KINDS
+                        and completed_task.inputs.get("pentester_slot")
+                    ):
+                        self._maybe_supervise(
+                            run.id,
+                            f"worker_checkpoint:{completed_task.inputs.get('pentester_slot')}",
+                        )
         finally:
             pool.shutdown(wait=True)
 
@@ -425,6 +454,219 @@ class Orchestrator:
 
     # ------------------------------------------------------------- scheduling
 
+    def _maybe_supervise(self, run_id: str, checkpoint: str) -> None:
+        """Run a bounded Supervisor checkpoint and update only unstarted lane work."""
+        if self._supervisor_disabled:
+            return
+        calls = self._supervisor_calls.get(run_id, 0)
+        if calls >= MAX_SUPERVISOR_CALLS_PER_RUN:
+            if not self._supervisor_budget_reported:
+                self._supervisor_budget_reported = True
+                self._event(
+                    run_id,
+                    "supervisor_budget_exhausted",
+                    {"limit": MAX_SUPERVISOR_CALLS_PER_RUN},
+                )
+            return
+
+        tasks = self._repos.tasks.list_by_run(run_id)
+        lane_tasks = [
+            task for task in tasks
+            if task.kind in ANALYSIS_KINDS and task.inputs.get("pentester_slot") in {1, 2, 3, 4}
+        ]
+        if not lane_tasks or not any(
+            task.status in {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}
+            for task in lane_tasks
+        ):
+            return
+
+        try:
+            self._registry.resolve(Role.SUPERVISOR)
+        except Exception as exc:  # noqa: BLE001 - deterministic lane split remains available
+            self._supervisor_disabled = True
+            self._event(
+                run_id,
+                "supervisor_unavailable",
+                {"reason": f"{type(exc).__name__}: {exc}"[:240]},
+            )
+            return
+
+        if self._budget is not None and self._budget.exhaustion_reason():
+            return
+
+        self._supervisor_calls[run_id] = calls + 1
+        supervisor_task = Task(
+            run_id=run_id,
+            kind=TaskKind.PLAN,
+            role=Role.SUPERVISOR,
+            objective="Coordinate the four Pentester lanes using the latest checkpoint state.",
+            inputs={"checkpoint": checkpoint, "checkpoint_number": calls + 1},
+            status=TaskStatus.RUNNING,
+        )
+        try:
+            output = self._call_agent(
+                SupervisorAgent(),
+                supervisor_task,
+                self._supervisor_context(run_id, checkpoint),
+            )
+            if not isinstance(output, SupervisorOutput):
+                output = SupervisorOutput.model_validate(output)
+            supervisor_task.status = TaskStatus.DONE
+            supervisor_task.attempts = 1
+            supervisor_task.result = output.model_dump(mode="json")
+            self._repos.tasks.create(supervisor_task)
+            self._apply_supervisor_output(run_id, output)
+            self._event(
+                run_id,
+                "supervisor_completed",
+                {
+                    "supervisor_task_id": supervisor_task.id,
+                    "checkpoint": checkpoint,
+                    "summary": output.summary,
+                    "assignments": len(output.assignments),
+                    "overlap_warnings": output.overlap_warnings,
+                },
+                task_id=supervisor_task.id,
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the four deterministic lanes
+            self._supervisor_disabled = True
+            self._event(
+                run_id,
+                "supervisor_failed",
+                {
+                    "supervisor_task_id": supervisor_task.id,
+                    "checkpoint": checkpoint,
+                    "reason": f"{type(exc).__name__}: {exc}"[:400],
+                    "fallback": "keep_existing_four_lane_assignments",
+                },
+                task_id=supervisor_task.id,
+            )
+
+    def _supervisor_context(self, run_id: str, checkpoint: str) -> dict[str, Any]:
+        tasks = self._repos.tasks.list_by_run(run_id)
+        findings = self._repos.findings.list_by_run(run_id)
+        evidence = self._repos.evidence.list_by_run(run_id)
+        return {
+            "target": self._target,
+            "authorized_scope": self._guard.snapshot(),
+            "checkpoint": checkpoint,
+            "lanes": self._worker_roster_context(tasks, None),
+            "findings": [
+                {
+                    "title": item.title,
+                    "category": item.category,
+                    "severity": item.severity.value,
+                    "status": item.status.value,
+                    "task_id": item.task_id,
+                }
+                for item in findings[-40:]
+            ],
+            "evidence_inventory": [
+                {
+                    "kind": item.kind.value,
+                    "source_url": item.source_url,
+                    "method": item.method,
+                    "summary": item.summary[:240],
+                }
+                for item in evidence[-60:]
+            ],
+            "constraints": {
+                "worker_slots": 4,
+                "max_parallel": 4,
+                "running_tasks_are_immutable": True,
+                "supervisor_may_only_guide_unstarted_work": True,
+            },
+        }
+
+    def _apply_supervisor_output(self, run_id: str, output: SupervisorOutput) -> None:
+        tasks = self._repos.tasks.list_by_run(run_id)
+        seen_slots: set[int] = set()
+        focus_owners: dict[str, int] = {}
+        for directive in output.assignments:
+            if directive.slot in seen_slots:
+                continue
+            seen_slots.add(directive.slot)
+            payload = directive.model_dump(mode="json")
+            unique_focus: list[str] = []
+            for item in payload.get("focus", []):
+                normalized = " ".join(str(item).casefold().split())
+                if not normalized or normalized in focus_owners:
+                    continue
+                focus_owners[normalized] = directive.slot
+                unique_focus.append(str(item))
+            payload["focus"] = unique_focus
+            with self._supervisor_lock:
+                self._supervisor_directives[directive.slot] = payload
+
+            updated = 0
+            for candidate in tasks:
+                if candidate.inputs.get("pentester_slot") != directive.slot:
+                    continue
+                if candidate.status not in {TaskStatus.PENDING, TaskStatus.READY}:
+                    continue
+                latest = self._repos.tasks.get(candidate.id)
+                if latest is None or latest.status not in {TaskStatus.PENDING, TaskStatus.READY}:
+                    continue
+                if latest.inputs.get("supervisor_directive") == payload:
+                    continue
+                latest.inputs = {**latest.inputs, "supervisor_directive": payload}
+                try:
+                    self._repos.tasks.update(latest)
+                    updated += 1
+                except ConcurrentModification:
+                    # A worker claimed the task concurrently; never overwrite in-progress work.
+                    continue
+            self._event(
+                run_id,
+                "supervisor_assignment_applied",
+                {
+                    "slot": directive.slot,
+                    "focus": payload["focus"],
+                    "avoid": payload["avoid"],
+                    "guidance": payload["guidance"],
+                    "updated_unstarted_tasks": updated,
+                },
+            )
+
+    def _worker_roster_context(
+        self, tasks: list[Task], current_slot: int | None
+    ) -> list[dict[str, Any]]:
+        roster: list[dict[str, Any]] = []
+        for slot in range(1, 5):
+            lane = [
+                task for task in tasks
+                if task.kind in ANALYSIS_KINDS and task.inputs.get("pentester_slot") == slot
+            ]
+            if not lane:
+                continue
+            lane.sort(key=lambda item: (item.created_at, item.id))
+            latest = lane[-1]
+            summaries = [
+                str(item.result.get("summary", ""))[:400]
+                for item in lane
+                if item.status == TaskStatus.DONE
+                and isinstance(item.result, dict)
+                and item.result.get("summary")
+            ][-3:]
+            with self._supervisor_lock:
+                directive = dict(self._supervisor_directives.get(slot, {}))
+            roster.append(
+                {
+                    "slot": slot,
+                    "label": latest.inputs.get("pentester_label", f"Pentester {slot}"),
+                    "status": latest.status.value,
+                    "current_objective": latest.objective,
+                    "active": any(item.status == TaskStatus.RUNNING for item in lane),
+                    "unstarted_task_ids": [
+                        item.id for item in lane
+                        if item.status in {TaskStatus.PENDING, TaskStatus.READY}
+                    ],
+                    "completed_summaries": summaries,
+                    "supervisor_directive": directive,
+                    "is_current_worker": slot == current_slot,
+                }
+            )
+        return roster
 
     def _schedule_followups(self, run_id: str) -> None:
         """Schedule one deterministic evidence-integrity audit after Pentester work settles."""
@@ -796,6 +1038,13 @@ class Orchestrator:
         for key in ("pentester_slot", "pentester_label"):
             if key in task.inputs:
                 followup_inputs[key] = task.inputs[key]
+        slot = task.inputs.get("pentester_slot")
+        directive = task.inputs.get("supervisor_directive")
+        if not isinstance(directive, dict) and isinstance(slot, int):
+            with self._supervisor_lock:
+                directive = self._supervisor_directives.get(slot)
+        if isinstance(directive, dict):
+            followup_inputs["supervisor_directive"] = dict(directive)
         if isinstance(task.inputs.get("rework_finding_id"), str):
             followup_inputs["rework_finding_id"] = task.inputs["rework_finding_id"]
             followup_inputs["missing_evidence"] = task.inputs.get("missing_evidence", [])
@@ -1016,8 +1265,23 @@ class Orchestrator:
             "max_replans": self._run_budget.max_replans,
             "external_tools": self._external_tools_context(),
             "cross_run_knowledge": self._knowledge_context(),
+            "supervisor_guidance": (
+                task.inputs.get("supervisor_directive")
+                if isinstance(task.inputs.get("supervisor_directive"), dict)
+                else self._current_supervisor_directive(task.inputs.get("pentester_slot"))
+            ),
+            "worker_roster": self._worker_roster_context(
+                tasks,
+                task.inputs.get("pentester_slot") if isinstance(task.inputs.get("pentester_slot"), int) else None,
+            ),
             "oast_callback_url": self._oast.url if self._oast_started else None,
         }
+
+    def _current_supervisor_directive(self, slot: Any) -> dict[str, Any]:
+        if not isinstance(slot, int):
+            return {}
+        with self._supervisor_lock:
+            return dict(self._supervisor_directives.get(slot, {}))
 
     def _knowledge_context(self) -> list[dict[str, str]]:
         entries = []
