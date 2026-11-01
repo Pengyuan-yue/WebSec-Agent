@@ -22,6 +22,7 @@ def test_supervisor_output_is_limited_to_four_fixed_slots():
             "assignments": [
                 {
                     "slot": slot,
+                    "objective": f"Handle distinct authorized work area number {slot}.",
                     "focus": [f"area {slot}"],
                     "avoid": [],
                     "guidance": "Use existing in-scope evidence.",
