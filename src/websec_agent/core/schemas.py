@@ -37,8 +37,12 @@ class TaskKind(str, Enum):
 
 
 class Role(str, Enum):
-    PLANNER = "planner"
+    # SYSTEM handles deterministic harness tasks (audit/report) without an LLM.
+    SYSTEM = "system"
     PENTESTER = "pentester"
+
+    # Retained so historical database rows remain readable.
+    PLANNER = "planner"
     REVIEWER = "reviewer"
     AUDITOR = "auditor"
     REPORTER = "reporter"
