@@ -270,6 +270,7 @@ class PentesterOutput(StrictModel):
 
 class SupervisorDirective(StrictModel):
     slot: int = Field(ge=1, le=4)
+    objective: str = Field(min_length=20, max_length=800)
     focus: list[str] = Field(default_factory=list, max_length=5)
     avoid: list[str] = Field(default_factory=list, max_length=5)
     guidance: str = Field(default="", max_length=600)
