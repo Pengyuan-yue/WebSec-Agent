@@ -1472,8 +1472,6 @@ class Orchestrator:
                 kind = "injection_point"
             elif any(word in text for word in ("credential", "auth", "login", "session", "password")):
                 kind = "credential"
-            elif any(word in text for word in ("path", "directory", "endpoint", "exposure", "file")):
-                kind = "path"
             else:
                 kind = "confirmed_finding"
             entries.append(
