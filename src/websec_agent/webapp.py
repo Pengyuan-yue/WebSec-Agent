@@ -625,6 +625,7 @@ def create_app(console: Console) -> FastAPI:
                     "status": t.status.value,
                     "objective": t.objective,
                     "priority": t.priority,
+                    "agent": t.inputs.get("pentester_label"),
                 }
                 for t in tasks
             ],
