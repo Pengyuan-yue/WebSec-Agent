@@ -796,7 +796,20 @@ class Orchestrator:
         }
 
     def _handle_pentest(self, task: Task) -> dict[str, Any]:
-        output = self._call_agent(PentesterAgent(), task, self._context(task))
+        context = self._context(task)
+        directive = context.get("supervisor_guidance")
+        agent_task = task
+        if isinstance(directive, dict) and directive:
+            guidance_lines = [
+                "Supervisor guidance for this checkpoint (coordination only):",
+                f"Focus: {', '.join(directive.get('focus') or [])}",
+                f"Avoid duplicating: {', '.join(directive.get('avoid') or [])}",
+                f"Guidance: {directive.get('guidance', '')}",
+            ]
+            agent_task = task.model_copy(
+                update={"objective": f"{task.objective}\n\n" + "\n".join(guidance_lines)}
+            )
+        output = self._call_agent(PentesterAgent(), agent_task, context)
 
         with self._persist_lock:
             rework_finding_id = task.inputs.get("rework_finding_id")
