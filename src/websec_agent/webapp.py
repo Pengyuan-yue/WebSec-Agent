@@ -18,9 +18,6 @@ from pydantic import BaseModel
 
 from .agents.orchestrator import Orchestrator
 from .agents.pentester import PentesterAgent
-from .agents.planner import PlannerAgent
-from .agents.reporter import ReporterAgent
-from .agents.reviewer import ReviewerAgent
 from .config import load_config, load_scope_policy, load_tools
 from .config_overrides import apply_overrides, load_local, save_local
 from .core.errors import ConfigError, ScopeViolation, WebSecError
@@ -61,10 +58,7 @@ FINDING_TRANSLATE_KEYS = ("title", "description", "impact", "reproduction", "rem
 # Snapshot of factory prompt defaults, taken at import time (before overrides are
 # applied) so the settings panel can always show and restore originals.
 _AGENT_CLASSES = {
-    Role.PLANNER: PlannerAgent,
     Role.PENTESTER: PentesterAgent,
-    Role.REVIEWER: ReviewerAgent,
-    Role.REPORTER: ReporterAgent,
 }
 DEFAULT_INSTRUCTIONS = {role.value: cls.instructions for role, cls in _AGENT_CLASSES.items()}
 
@@ -379,7 +373,7 @@ class Console:
             guard.expand(self.allow_hosts)
 
         registry = ModelRegistry(self.config)
-        for role in (Role.PLANNER, Role.PENTESTER, Role.REVIEWER, Role.REPORTER):
+        for role in (Role.PENTESTER,):
             registry.resolve(role)
 
         db = Database(self.db_url)
