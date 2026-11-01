@@ -126,7 +126,7 @@ class Orchestrator:
         self._start_oast(run.id)
 
         pool = ThreadPoolExecutor(
-            max_workers=max(4, self._run_budget.max_parallel), thread_name_prefix="websec-dispatch"
+            max_workers=4, thread_name_prefix="websec-dispatch"
         )
         try:
             while True:
@@ -152,7 +152,7 @@ class Orchestrator:
                     task
                     for task in ready
                     if task.kind in PARALLEL_KINDS
-                ][: max(4, self._run_budget.max_parallel)]
+                ][:4]
                 if len(batch) <= 1:
                     self._dispatch(ready[0])
                     continue
@@ -467,7 +467,7 @@ class Orchestrator:
         self._create_task(
             run_id,
             kind=TaskKind.AUDIT,
-            role=Role.AUDITOR,
+            role=Role.SYSTEM,
             objective="Programmatically audit evidence hashes, scope flags and finding completeness.",
             inputs={"finding_ids": [finding.id for finding in unaudited]},
             depends_on=work_ids,
@@ -768,6 +768,11 @@ class Orchestrator:
                 {"withheld": withheld},
                 task_id=task.id,
             )
+
+        # No newly scheduled collection means no new evidence can arrive; do not
+        # spin a follow-up Pentester task on requests already deduplicated.
+        if not child_ids:
+            return child_ids, None
 
         if self._budget.replan_limit_reached(self._repos.tasks.replan_count(task.run_id)):
             self._event(
