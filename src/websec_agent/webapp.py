@@ -537,7 +537,65 @@ class Console:
         return db, Repositories.build(db)
 
     # -------------------------------------------------------------------- chat
-    LAUNCH_RE = re.compile(r"^\[LAUNCH\s+(https?://[^\s\]]+)\]", re.IGNORECASE)
+    CHAT_ACTION_RE = re.compile(
+        r"\[(LAUNCH|PROJECT|ADDURL)\s+([^\]\n]*)\]", re.IGNORECASE
+    )
+
+    def _chat_actions(self, reply: str) -> tuple[str, list[str], dict[str, Any]]:
+        """Execute chat markers so the assistant can manage projects and launch
+        runs without the operator filling any form."""
+        notes: list[str] = []
+        extra: dict[str, Any] = {}
+        repos = Repositories.build(Database(self.db_url))
+        for match in list(self.CHAT_ACTION_RE.finditer(reply)):
+            kind = match.group(1).upper()
+            payload = match.group(2).strip()
+            if kind == "PROJECT":
+                name, _, urls_part = payload.partition("|")
+                name = name.strip() or "未命名项目"
+                urls = self._clean_urls(urls_part)
+                project = repos.projects.create(name, urls)
+                self.set_active_project(project.id)
+                notes.append(
+                    f"⏺ 已创建项目「{name}」（{len(urls)} 个 URL）并设为当前项目。"
+                )
+            elif kind == "ADDURL":
+                active = self.active_project_id()
+                if not active:
+                    notes.append("⏺ 追加 URL 失败：当前没有选中项目。")
+                    continue
+                current = repos.projects.get(active)
+                if current is None:
+                    notes.append("⏺ 追加 URL 失败：项目不存在。")
+                    continue
+                added = self._clean_urls(payload)
+                merged = list(dict.fromkeys([*current.urls, *added]))
+                repos.projects.update(active, urls=merged)
+                notes.append(
+                    f"⏺ 已向项目「{current.name}」追加 {len(added)} 个 URL，现共 {len(merged)} 个。"
+                )
+            elif kind == "LAUNCH":
+                if self.state.active_run_id:
+                    notes.append("⏺ 已有评估在运行，本次未启动新评估。")
+                    continue
+                target = payload.split()[0].rstrip(".,;、。") if payload else ""
+                if not target.startswith(("http://", "https://")):
+                    notes.append("⏺ 发起失败：需要一个完整的 http(s) URL。")
+                    continue
+                try:
+                    result = self.start_run(target, use_memory=True)
+                    extra = {"run_id": result["run_id"], "target": target}
+                    notes.append(
+                        f"⏺ 评估已启动（run {result['run_id'][:8]}），"
+                        "中栏实时展示执行流程。Agent 全程执行无害只读验证。"
+                    )
+                except HTTPException as exc:
+                    notes.append(f"⏺ 发起失败：{exc.detail}")
+            else:  # pragma: no cover - regex only matches the three kinds
+                continue
+            extra.setdefault("actions", []).append(kind.lower())
+        reply = self.CHAT_ACTION_RE.sub("", reply).strip()
+        return reply, notes, extra
 
     def chat(self, payload: ChatIn) -> dict[str, Any]:
         history = payload.history[-MAX_CHAT_HISTORY:]
@@ -552,21 +610,29 @@ class Console:
             "steps. Be concrete and reference findings/evidence by id when "
             "useful. Reply in the operator's language (Chinese by default).\n\n"
             "LAUNCHING ASSESSMENTS: the operator starts a run by chatting. When "
-            "the operator's message names a clear target URL and asks you to "
-            "start testing (评估/测试/渗透/打一下), AND state.active_run_id is "
-            "null, begin your reply with the marker [LAUNCH <url>] followed by "
-            "a one-line Chinese confirmation (mention harmless read-only "
-            "doctrine). The harness starts the run and shows it live. Do NOT "
-            "output the marker when: a run is already active (active_run_id is "
-            "set — tell the operator to wait), no clear absolute URL was given "
-            "(ask for one), or the operator only asked a question. Never "
-            "fabricate the marker for hosts other than what the operator "
-            "named.\n\n"
-            "PROJECTS: assessments belong to projects. state.active_project "
-            "lists its URLs; when the operator asks to test the project (or names "
-            "any URL of the active project) use the marker with that exact URL "
-            "from state.active_project.urls. Scope is unrestricted: any http(s) "
-            "URL may be tested, including hosts reached through redirects.\n\n"
+            "the operator names a clear target URL and asks you to start testing "
+            "(评估/测试/渗透/打一下), AND state.active_run_id is null, output the "
+            "marker [LAUNCH <url>] on its own line, followed by a one-line "
+            "Chinese confirmation. The harness starts the run, shows it live, "
+            "and writes a local report when it finishes. Do NOT output the "
+            "marker when a run is already active, when you would have to invent "
+            "the URL, or when the operator only asked a question.\n\n"
+            "PROJECTS: every assessment belongs to a project. The operator may "
+            "skip forms entirely and just say e.g. 挖公益SRC漏洞 - no URL at "
+            "all. In that case:\n"
+            "1. create a project first with [PROJECT 项目名 | url1 url2] (the "
+            "part after | is optional - a project may start with zero URLs);\n"
+            "2. when the operator tells you where to look (SRC platform, domain "
+            "list, keyword) add every concrete URL to the active project with "
+            "[ADDURL url1 url2] - never invent or guess hosts, only use URLs "
+            "the operator supplied or that are present in the console state;\n"
+            "3. ask exactly one short question if you still need a concrete "
+            "URL, then launch with [LAUNCH <url>] once you have one.\n"
+            "Each URL of a project is tested in its own run. Scope is "
+            "unrestricted: redirects and other hosts are allowed.\n\n"
+            "REPORT: when a run finishes, the harness writes a local report - "
+            "summarise findings and remind the operator it is stored under "
+            "artifacts and viewable from the console.\n\n"
             "Current console state (JSON):\n" + context
         )
         settings, gateway = ModelRegistry(self.config).resolve(Role.PENTESTER)
@@ -590,20 +656,9 @@ class Console:
 
         reply = response.text.strip()
         extra: dict[str, Any] = {}
-        match = self.LAUNCH_RE.match(reply)
-        if match:
-            target = match.group(1).rstrip(".,;、。")
-            reply = reply[match.end() :].strip()
-            try:
-                result = self.start_run(target, use_memory=True)
-                extra = {"run_id": result["run_id"], "target": target}
-                reply += (
-                    f"\n\n⏺ 评估已启动（run {result['run_id'][:8]}），"
-                    "中栏实时展示执行流程。Agent 全程执行无害只读验证。"
-                )
-            except HTTPException as exc:
-                detail = str(exc.detail)
-                reply += f"\n\n⏺ 发起失败：{detail}"
+        reply, notes, extra = self._chat_actions(reply)
+        if notes:
+            reply = (reply + "\n\n" + "\n".join(notes)).strip()
         return {"reply": reply, "model": response.model, **extra}
 
     def _chat_context(self) -> str:
@@ -705,8 +760,6 @@ def create_app(console: Console) -> FastAPI:
         if not name:
             raise HTTPException(status_code=400, detail="项目名称不能为空")
         urls = console._clean_urls(body.urls)
-        if not urls:
-            raise HTTPException(status_code=400, detail="至少填写一个目标 URL")
         db, repos = console.db_view()
         project = repos.projects.create(name, urls)
         if not console.active_project_id():
