@@ -60,6 +60,7 @@ FINDING_TRANSLATE_KEYS = ("title", "description", "impact", "reproduction", "rem
 _AGENT_CLASSES = {
     Role.PENTESTER: PentesterAgent,
 }
+_MODEL_ROLES = (Role.PENTESTER, Role.SUPERVISOR)
 DEFAULT_INSTRUCTIONS = {role.value: cls.instructions for role, cls in _AGENT_CLASSES.items()}
 
 
@@ -373,7 +374,7 @@ class Console:
             guard.expand(self.allow_hosts)
 
         registry = ModelRegistry(self.config)
-        for role in (Role.PENTESTER,):
+        for role in _MODEL_ROLES:
             registry.resolve(role)
 
         db = Database(self.db_url)
@@ -711,7 +712,7 @@ def create_app(console: Console) -> FastAPI:
             "key_set": bool(key),
             "models": {
                 role.value: console.config.roles[role].model
-                for role in _AGENT_CLASSES
+                for role in _MODEL_ROLES
             },
             "instructions": {
                 role.value: (instructions.get(role.value) or DEFAULT_INSTRUCTIONS[role.value])
@@ -737,7 +738,7 @@ def create_app(console: Console) -> FastAPI:
         if isinstance(payload.get("models"), dict):
             merged = local.get("models") or {}
             for role_value, model in payload["models"].items():
-                if role_value in {role.value for role in _AGENT_CLASSES} and isinstance(model, str):
+                if role_value in {role.value for role in _MODEL_ROLES} and isinstance(model, str):
                     merged[role_value] = model.strip()
             local["models"] = merged
         if isinstance(payload.get("instructions"), dict):
