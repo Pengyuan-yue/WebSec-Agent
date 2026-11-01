@@ -42,8 +42,10 @@ def test_four_pentesters_run_in_parallel(tmp_path):
     barrier = threading.Barrier(4, timeout=15)
     count_lock = threading.Lock()
     overlaps = {"pentester": 0}
+    pentester_contexts = []
 
     def pentester(_request) -> str:
+        pentester_contexts.append(json_messages(_request)["context"])
         barrier.wait(timeout=15)
         with count_lock:
             overlaps["pentester"] += 1
@@ -102,6 +104,10 @@ def test_four_pentesters_run_in_parallel(tmp_path):
     assert overlaps["pentester"] == 4
     assert run.budget["max_parallel"] == 4
     assert supervisor_calls and supervisor_calls[0] == "initial_assignment"
+    assert len(pentester_contexts) == 4
+    focuses = [tuple(item["supervisor_guidance"].get("focus", [])) for item in pentester_contexts]
+    assert all(focuses)
+    assert len(set(focuses)) == 4
 
     tasks = repos.tasks.list_by_run(run.id)
     failures = [(t.kind.value, t.error) for t in tasks if t.status != TaskStatus.DONE]
