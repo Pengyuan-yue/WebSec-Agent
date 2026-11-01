@@ -114,7 +114,7 @@ def _run(args: argparse.Namespace) -> int:
             guard.expand(args.allow_host)
 
         registry = ModelRegistry(config)
-        for role in (Role.PLANNER, Role.PENTESTER, Role.REVIEWER, Role.REPORTER):
+        for role in (Role.PENTESTER,):
             registry.resolve(role)
     except (ConfigError, ScopeViolation) as exc:
         print(f"startup error: {exc}", file=sys.stderr)
