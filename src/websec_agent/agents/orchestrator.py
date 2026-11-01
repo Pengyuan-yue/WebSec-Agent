@@ -83,7 +83,8 @@ class Orchestrator:
         self._target = target
         self._executor = executor
         self._registry = registry
-        self._run_budget = run_budget
+        # Four Pentester workers are a fixed part of this orchestration model.
+        self._run_budget = run_budget.model_copy(update={"max_parallel": 4})
         self._artifacts_root = Path(artifacts_root)
         self._repos = Repositories.build(db)
         self._guard = executor.guard
