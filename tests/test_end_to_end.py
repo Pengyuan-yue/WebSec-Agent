@@ -167,6 +167,7 @@ def test_end_to_end_run_with_four_pentesters_and_deterministic_report(tmp_path):
     assert run_payload["run"]["status"] == "completed"
     assert run_payload["stats"]["tasks"].get("done") == len(tasks)
 
+    assert run.budget["max_parallel"] == 4
     assert run.status.value == "completed"
     assert run.stats["findings"]["confirmed"] == 1
     assert state["pentester_calls"] == 4
