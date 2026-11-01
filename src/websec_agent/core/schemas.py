@@ -27,6 +27,7 @@ class StrictModel(BaseModel):
 
 class TaskKind(str, Enum):
     PLAN = "plan"
+    SUPERVISE = "supervise"
     RECON = "recon"
     ANALYZE = "analyze"
     EXPLOIT = "exploit"
