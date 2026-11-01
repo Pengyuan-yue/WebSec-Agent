@@ -497,7 +497,7 @@ class Orchestrator:
         self._supervisor_calls[run_id] = calls + 1
         supervisor_task = Task(
             run_id=run_id,
-            kind=TaskKind.PLAN,
+            kind=TaskKind.SUPERVISE,
             role=Role.SUPERVISOR,
             objective="Coordinate the four Pentester lanes using the latest checkpoint state.",
             inputs={"checkpoint": checkpoint, "checkpoint_number": calls + 1},
