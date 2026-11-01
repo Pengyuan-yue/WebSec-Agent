@@ -1,0 +1,89 @@
+# External tools the pentester agent may invoke via the external_tool request.
+# Scope is enforced at execution time: every URL and every bare-host argument
+# must pass the ScopeGuard check before the process is spawned. Proxy flags are
+# injected by the harness ({PROXY} = proxy URL, {PROXY_BARE} = host:port).
+allow_destructive: false
+tools:
+  ffuf:
+    name: ffuf
+    path: tools/bin/ffuf
+    description: Web fuzzer for content/parameter discovery. Wordlists - tools/wordlists/common-small.txt (fast first pass, 800 common paths), tools/wordlists/raft-small-words.txt (deep second pass, 43k words), tools/wordlists/apis/objects.txt + tools/wordlists/apis/api-endpoints.txt (API path enumeration). Use -u URL/FUZZ -w <wordlist> -t 20 -fc 404 -o /dev/stdout -of json. Run one wordlist per invocation; prefer common-small.txt first, then raft-small-words.txt on interesting directories, and the API lists against /api or similar prefixes.
+    arg_scope: url
+    blocked_args: ["-x", "--proxy"]
+    timeout_seconds: 300
+  nuclei:
+    name: nuclei
+    path: tools/bin/nuclei
+    description: Template vulnerability scanner (13k+ templates). Use -u URL -severity critical,high -silent. Batch by attack surface - run one invocation per discovered directory/endpoint group (e.g. -u http://target/login/ then -u http://target/admin/) instead of one scan for the whole origin, so templates match path context.
+    arg_scope: url
+    blocked_args: ["-interactsh-server", "-lfa", "-passive"]
+    timeout_seconds: 300
+  sqlmap:
+    name: sqlmap
+    path: python
+    description: SQL injection validation tool. Target ONE parameter per run with fast flags, e.g. -u URL --data "uid=x&passw=y" --batch --level 1 --risk 1 --threads 5 --timeout 10 --retries 1. The harness kills it at 300s, so keep --level/--risk low; skip slow crawlers like --forms and --crawl.
+    arg_scope: url
+    pre_args: ["tools/sqlmap/sqlmap.py"]
+    blocked_args: ["--os-shell", "--os-cmd", "--os-pwn", "--os-bof", "--priv-esc", "--file-write", "--file-dest", "--eval", "--wizard", "--os-smbrelay", "--reg-add", "--reg-del", "--forms", "--crawl"]
+    proxy_args: ["--proxy", "{PROXY}"]
+    timeout_seconds: 300
+  httpx:
+    name: httpx
+    path: tools/bin/httpx
+    description: Fast HTTP prober for URL lists; reports status, title, tech. Use -u URL -silent -title -status-code -tech-detect
+    arg_scope: url
+    blocked_args: ["-http-proxy"]
+    proxy_args: ["-http-proxy", "{PROXY}"]
+    timeout_seconds: 120
+  katana:
+    name: katana
+    path: tools/bin/katana
+    description: Web crawler for endpoint/form/JS discovery. Use -u URL -d 3 -silent -nc -depth 3 for full-depth crawls of already-discovered directories (e.g. -u http://target/bank/ -d 3); use -d 1 for unknown areas. Crawl each discovered directory separately.
+    arg_scope: url
+    blocked_args: ["-system-chrome", "-headless", "-chrome"]
+    timeout_seconds: 240
+  gau:
+    name: gau
+    path: tools/bin/gau
+    description: Fetch known historical URLs for a domain from Wayback/CommonCrawl/URLScan. Takes a bare domain, e.g. gau demo.testfire.net --threads 8
+    arg_scope: url
+    timeout_seconds: 180
+  dalfox:
+    name: dalfox
+    path: tools/bin/dalfox
+    description: XSS scanner and payload generator. Use url "URL?param=x" --skip-mining --silence for fast scans, or pipe mode with found URLs
+    arg_scope: url
+    blocked_args: ["--proxy"]
+    proxy_args: ["--proxy", "{PROXY}"]
+    timeout_seconds: 600
+  commix:
+    name: commix
+    path: python
+    description: Automated OS command injection tester. Use --batch -u "URL?param=value" (always pass --batch; single-parameter targets only)
+    arg_scope: url
+    pre_args: ["tools/commix/commix.py"]
+    blocked_args: ["--proxy", "--os-shell", "--os-pwn", "--os-smbrelay", "--os-bof", "--priv-esc", "--file-write", "--file-dest", "--wizard", "--backdoor"]
+    proxy_args: ["--proxy", "{PROXY}"]
+    timeout_seconds: 600
+  arjun:
+    name: arjun
+    path: .venv/bin/arjun
+    description: Hidden HTTP parameter discovery. Use -u URL -m GET (then re-test discovered params for injection)
+    arg_scope: url
+    blocked_args: ["-oB"]
+    timeout_seconds: 300
+  nikto:
+    name: nikto
+    path: perl
+    description: Classic web server scanner (headers, configs, files). Use -h URL -Tuning 6 -nointeractive (server misconfig/file exposure tunings; full scans are slow through the proxy)
+    arg_scope: url
+    pre_args: ["tools/nikto/program/nikto.pl"]
+    blocked_args: ["-useproxy", "-proxy", "-evasion"]
+    proxy_args: ["-useproxy", "-proxy", "{PROXY_BARE}"]
+    timeout_seconds: 600
+  wafw00f:
+    name: wafw00f
+    path: .venv/bin/wafw00f
+    description: WAF fingerprinting. Use -a URL (detects WAF products; informs payload encoding strategy)
+    arg_scope: url
+    timeout_seconds: 120

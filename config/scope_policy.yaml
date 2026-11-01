@@ -1,0 +1,16 @@
+# 授权范围。run 的目标 host 始终被视为已授权；这里用于显式扩容与收紧。
+#
+# allowed_hosts 支持精确 host 与 *.suffix 通配（通配只匹配子域，不含 apex）。
+# 所有实际发包在工具执行层经过 ScopeGuard，不依赖 prompt 自觉。
+# 发现范围外资产时不会自动扩容，任务会失败并记录 scope_violation 事件，需用户追加授权。
+
+allowed_hosts:
+  - "demo.testfire.net"
+
+denied_hosts: []
+
+# 允许访问私网 / 回环地址（本地测试时才开启）。
+allow_private: false
+
+# 允许的端口；空列表表示任意端口。
+allowed_ports: []
