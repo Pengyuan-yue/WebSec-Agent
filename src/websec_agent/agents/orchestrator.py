@@ -610,6 +610,7 @@ class Orchestrator:
                 if latest.inputs.get("supervisor_directive") == payload:
                     continue
                 latest.inputs = {**latest.inputs, "supervisor_directive": payload}
+                latest.objective = directive.objective
                 try:
                     self._repos.tasks.update(latest)
                     updated += 1
@@ -806,10 +807,7 @@ class Orchestrator:
                 f"Avoid duplicating: {', '.join(directive.get('avoid') or [])}",
                 f"Guidance: {directive.get('guidance', '')}",
             ]
-            agent_task = task.model_copy(
-                update={"objective": f"{task.objective}\n\n" + "\n".join(guidance_lines)}
-            )
-        output = self._call_agent(PentesterAgent(), agent_task, context)
+        output = self._call_agent(PentesterAgent(), task, context)
 
         with self._persist_lock:
             rework_finding_id = task.inputs.get("rework_finding_id")
