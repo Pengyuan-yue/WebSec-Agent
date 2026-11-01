@@ -79,6 +79,7 @@ def test_four_pentesters_run_in_parallel(tmp_path):
     executor.close()
 
     assert overlaps["pentester"] == 4
+    assert run.budget["max_parallel"] == 4
 
     tasks = repos.tasks.list_by_run(run.id)
     failures = [(t.kind.value, t.error) for t in tasks if t.status != TaskStatus.DONE]
