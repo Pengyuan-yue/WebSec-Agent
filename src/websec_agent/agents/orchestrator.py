@@ -349,25 +349,13 @@ class Orchestrator:
             )
             recon_ids.append(task.id)
 
-        # Four independent Pentester workers start together after baseline recon.
-        # They share the existing Pentester prompt and model configuration.
+        # Baseline recon finishes first. The Supervisor assigns the initial
+        # objectives before any Pentester starts; workers do not self-select lanes.
         pentester_lanes = [
-            (
-                "Pentester 1",
-                "Assess the externally visible surface, baseline configuration, exposed resources, and high-impact misconfigurations.",
-            ),
-            (
-                "Pentester 2",
-                "Assess authentication, session handling, and authorization boundaries using the available evidence and application flows.",
-            ),
-            (
-                "Pentester 3",
-                "Assess server-side request handling, user-controlled inputs, and API behavior for high-impact security issues.",
-            ),
-            (
-                "Pentester 4",
-                "Assess browser-visible functionality, client-side behavior, API interactions, and high-impact business-logic boundaries.",
-            ),
+            ("Pentester 1", "Await Supervisor assignment for worker slot 1."),
+            ("Pentester 2", "Await Supervisor assignment for worker slot 2."),
+            ("Pentester 3", "Await Supervisor assignment for worker slot 3."),
+            ("Pentester 4", "Await Supervisor assignment for worker slot 4."),
         ]
         for slot, (label, objective) in enumerate(pentester_lanes, start=1):
             self._create_task(
