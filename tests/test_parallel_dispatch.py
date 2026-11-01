@@ -51,7 +51,28 @@ def test_four_pentesters_run_in_parallel(tmp_path):
             {"summary": "Nothing severe found.", "findings": [], "tool_requests": []}
         )
 
-    registry = StaticRegistry({Role.PENTESTER: FakeGateway(pentester)})
+    supervisor_calls = []
+
+    def supervisor(request) -> str:
+        context = json_messages(request)["context"]
+        supervisor_calls.append(context["checkpoint"])
+        return json.dumps(
+            {
+                "summary": "Keep the four workers on distinct responsibility areas.",
+                "assignments": [
+                    {"slot": 1, "focus": ["public surface and configuration"], "avoid": ["identity workflows"], "guidance": "Stay within the assigned area."},
+                    {"slot": 2, "focus": ["identity and access boundaries"], "avoid": ["public configuration inventory"], "guidance": "Use only evidence already in scope."},
+                    {"slot": 3, "focus": ["server-side input handling"], "avoid": ["browser presentation review"], "guidance": "Prefer distinct evidence."},
+                    {"slot": 4, "focus": ["browser behavior and workflow logic"], "avoid": ["server-side input review"], "guidance": "Avoid repeating completed checks."},
+                ],
+                "overlap_warnings": [],
+            }
+        )
+
+    registry = StaticRegistry({
+        Role.PENTESTER: FakeGateway(pentester),
+        Role.SUPERVISOR: FakeGateway(supervisor),
+    })
 
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
@@ -80,6 +101,7 @@ def test_four_pentesters_run_in_parallel(tmp_path):
 
     assert overlaps["pentester"] == 4
     assert run.budget["max_parallel"] == 4
+    assert supervisor_calls and supervisor_calls[0] == "initial_assignment"
 
     tasks = repos.tasks.list_by_run(run.id)
     failures = [(t.kind.value, t.error) for t in tasks if t.status != TaskStatus.DONE]
@@ -93,10 +115,13 @@ def test_four_pentesters_run_in_parallel(tmp_path):
     assert {task.inputs["pentester_label"] for task in pentester_tasks} == {
         "Pentester 1", "Pentester 2", "Pentester 3", "Pentester 4"
     }
+    assert all("supervisor_directive" in task.inputs for task in pentester_tasks)
 
     events = repos.events.list_by_run(run.id)
     parallel_events = [event for event in events if event.type == "dispatch_parallel"]
     assert any(set(event.payload.get("kinds", [])) == {"analyze"} for event in parallel_events)
+    assert any(event.type == "supervisor_completed" for event in events)
+    assert any(event.type == "supervisor_assignment_applied" for event in events)
 
     kinds = Counter(task.kind.value for task in tasks)
     assert kinds["analyze"] == 4
