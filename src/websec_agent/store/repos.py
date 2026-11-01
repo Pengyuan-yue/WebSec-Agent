@@ -225,6 +225,7 @@ class TaskRepository:
                     f"task {task.id} version conflict: db={row.version} expected={task.version}"
                 )
             row.status = task.status.value
+            row.objective = task.objective
             row.priority = task.priority
             row.inputs = task.inputs
             row.depends_on = task.depends_on
