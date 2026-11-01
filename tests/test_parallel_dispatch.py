@@ -127,4 +127,5 @@ def test_four_pentesters_run_in_parallel(tmp_path):
     assert kinds["analyze"] == 4
     assert kinds["report"] == 1
     assert kinds["plan"] == 0
+    assert kinds["supervise"] >= 1
     assert kinds["review"] == 0
