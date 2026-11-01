@@ -723,7 +723,7 @@ def create_app(console: Console) -> FastAPI:
                 for role in _AGENT_CLASSES
             },
             "run": {
-                "max_parallel": console.config.run.max_parallel,
+                "max_parallel": 4,
                 "max_tasks": console.config.run.max_tasks,
             },
             "theme": local.get("theme") or "light",
@@ -752,7 +752,7 @@ def create_app(console: Console) -> FastAPI:
             local["instructions"] = merged
         if isinstance(payload.get("run"), dict):
             merged = local.get("run") or {}
-            for name in ("max_parallel", "max_tasks"):
+            for name in ("max_tasks",):
                 value = payload["run"].get(name)
                 if isinstance(value, int) and value >= 1:
                     merged[name] = value
