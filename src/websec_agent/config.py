@@ -38,6 +38,10 @@ class AppConfig(BaseModel):
 class ScopePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # true = no host / port / private-address restrictions at all: any http(s)
+    # URL the operator targets is reachable, including hosts reached through
+    # 302 redirects. Projects are the only notion of "what belongs together".
+    unrestricted: bool = False
     allowed_hosts: list[str] = Field(default_factory=list)
     denied_hosts: list[str] = Field(default_factory=list)
     allow_private: bool = False
@@ -45,6 +49,7 @@ class ScopePolicy(BaseModel):
 
     def snapshot(self, target: str) -> dict:
         return {
+            "unrestricted": self.unrestricted,
             "allowed_hosts": list(self.allowed_hosts),
             "denied_hosts": list(self.denied_hosts),
             "allow_private": self.allow_private,

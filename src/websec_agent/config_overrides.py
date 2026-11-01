@@ -26,6 +26,7 @@ VALID_SETTINGS_KEYS = (
     "instructions",
     "run",
     "theme",
+    "active_project_id",
 )
 
 

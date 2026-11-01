@@ -245,7 +245,10 @@
     <span>已确认 <b id="h_finds">0</b></span>
     <span>工具 <b id="h_tools">0</b></span>
   </div>
+  <select id="projsel" onchange="switchProject(this.value)" title="切换项目"></select>
+  <button class="ghost" id="projbtn" onclick="openProject()" title="新建 / 编辑项目">＋项目</button>
   <select id="runsel" onchange="selectRun(this.value)" title="切换历史评估"></select>
+  <button class="ghost" id="launchbtn" onclick="openLaunch()" title="对当前项目发起评估">▶ 评估</button>
   <button id="setbtn" title="设置" onclick="openSettings()">⚙</button>
   <div class="pill" id="statuspill"><span class="pfx">⏺</span> 空闲</div>
 </header>
@@ -417,9 +420,112 @@ function setPill(cls, text){
 
 function hostOf(u){ try{ return new URL(u).hostname; }catch(e){ return u; } }
 
+/* ---------------- 项目：一个项目可挂多个 URL ---------------- */
+let activeProject = null;
+
+async function refreshProjects(){
+  try{
+    const d = await api('/api/projects');
+    window._projects = d.projects || [];
+    activeProject = (d.projects||[]).find(p=>p.id===d.active_project_id) || null;
+    const sel = $('projsel');
+    sel.innerHTML = '<option value="">— 全部项目 —</option>' + (d.projects||[]).map(p=>
+      `<option value="${esc(p.id)}">${esc(p.name)} · ${p.urls.length} URL · ${p.run_count||0} 次评估</option>`).join('');
+    sel.value = activeProject ? activeProject.id : '';
+    $('launchbtn').style.display = activeProject ? '' : 'none';
+    $('projbtn').textContent = activeProject ? '✎ 项目' : '＋项目';
+  }catch(e){ console.error(e); }
+}
+
+async function switchProject(id){
+  try{
+    await api(id ? '/api/projects/'+id+'/activate' : '/api/projects/deactivate', {method:'POST'});
+    await refreshProjects();
+    selectedRun = null; evCount = 0;
+    $('events').innerHTML = '<div class="empty">— 选择一个评估，或发起新评估 —</div>';
+    $('findings').innerHTML = '<div class="empty">— 暂无发现 —</div>';
+    await refreshRuns();
+  }catch(e){ alert('切换项目失败: '+e.message); }
+}
+
+let editingProject = false;
+function openProject(){
+  const p = activeProject;
+  editingProject = !!p;
+  $('modal-title').textContent = p ? '编辑项目 · ' + p.name : '新建项目';
+  $('modal-body').innerHTML = `
+    <div class="sec"><h4>项目名称</h4>
+      <input id="pj_name" type="text" spellcheck="false" style="width:100%;background:var(--panel);border:1px solid var(--line2);color:var(--text);padding:7px 9px;border-radius:4px"></div>
+    <div class="sec"><h4>目标 URL · 每行一个，可填多个</h4>
+      <textarea id="pj_urls" rows="8" spellcheck="false" placeholder="https://target.example.com/\nhttps://target.example.com/app\nhttps://api.target.example.com/" style="width:100%;background:var(--panel);border:1px solid var(--line2);color:var(--text);padding:8px 10px;font:11px/1.55 ui-monospace,monospace;border-radius:4px;resize:vertical"></textarea></div>
+    <div id="pj_msg" style="color:var(--dim);font-size:11px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:4px">
+      <button class="primary" onclick="saveProject()">保存</button>
+      ${p?`<button class="ghost" onclick="deleteProject()">删除项目</button>`:''}
+      <button class="ghost" onclick="closeModal()">取消</button>
+    </div>`;
+  $('pj_name').value = p ? p.name : '';
+  $('pj_urls').value = p ? p.urls.join('\n') : '';
+  $('overlay').classList.add('show');
+}
+
+async function saveProject(){
+  const name = $('pj_name').value.trim();
+  const urls = $('pj_urls').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  if(!name){ $('pj_msg').textContent = '项目名称不能为空'; return; }
+  if(!urls.length){ $('pj_msg').textContent = '至少填写一个目标 URL'; return; }
+  try{
+    const out = await api(editingProject ? '/api/projects/'+activeProject.id : '/api/projects',
+      {method: editingProject ? 'PUT' : 'POST', headers:{'Content-Type':'application/json'},
+       body: JSON.stringify({name, urls})});
+    const pid = editingProject ? activeProject.id : out.project.id;
+    await api('/api/projects/'+pid+'/activate', {method:'POST'});
+    closeModal(); await refreshProjects(); await refreshRuns();
+  }catch(e){ $('pj_msg').textContent = '保存失败: '+e.message; }
+}
+
+async function deleteProject(){
+  if(!editingProject) return;
+  if(!confirm('删除项目「'+activeProject.name+'」？已产生的评估记录会保留。')) return;
+  try{
+    await api('/api/projects/'+activeProject.id, {method:'DELETE'});
+    closeModal(); activeProject = null; await refreshProjects(); await refreshRuns();
+  }catch(e){ $('pj_msg').textContent = '删除失败: '+e.message; }
+}
+
+function openLaunch(){
+  if(!activeProject){
+    $('modal-title').textContent = '发起评估';
+    $('modal-body').innerHTML = '<div class="empty">先点「＋项目」创建项目并填入目标 URL，项目可包含多个 URL。</div>';
+    $('overlay').classList.add('show');
+    return;
+  }
+  $('modal-title').textContent = '发起评估 · ' + activeProject.name;
+  $('modal-body').innerHTML = `
+    <div style="color:var(--dim);font-size:11px;margin-bottom:8px">选择本项目中的一个 URL 作为本次评估入口（作用域无限制，跳转与关联主机均放行）</div>
+    ${activeProject.urls.map(u=>`<div class="sec" style="display:flex;align-items:center;gap:10px">
+        <code style="flex:1;word-break:break-all">${esc(u)}</code>
+        <button class="primary" onclick="launchUrl('${esc(u).replace(/'/g,'&#39;')}')">评估</button></div>`).join('')}`;
+  $('overlay').classList.add('show');
+}
+
+async function launchUrl(url){
+  closeModal();
+  $('events').innerHTML = '<div class="empty">启动中…</div>';
+  try{
+    const out = await api('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({target:url, project_id:activeProject.id})});
+    selectedRun = out.run_id; evCount = 0;
+    for(const k in flowTasks) delete flowTasks[k];
+    for(const k in flowFinds) delete flowFinds[k];
+    setPill('run','评估中'); startPolling(); await refreshProjects(); await refreshRuns(); pollEvents(true);
+  }catch(e){ $('events').innerHTML = '<div class="empty">启动失败: '+esc(e.message)+'</div>'; }
+}
+
 async function refreshRuns(){
   try{
-    const data = await api('/api/runs');
+    const q = activeProject ? '/api/runs?project_id='+encodeURIComponent(activeProject.id) : '/api/runs';
+    const data = await api(q);
     window._runs = data.runs;
     const sel = $('runsel');
     const groups = new Map();                    // 项目（目标）分组
@@ -725,11 +831,13 @@ async function saveSettings(){
 
 /* init */
 setTheme(localStorage.getItem('theme')||'light');
-refreshRuns(); loadKnowledge(); selectInitialRun();
+refreshProjects().then(()=>{ refreshRuns(); selectInitialRun(); });
+loadKnowledge();
 setInterval(()=>{ api('/api/state').then(s=>{ if(s.active_run_id){ refreshRuns(); pollEvents(); } }).catch(()=>{}); }, 8000);
 async function selectInitialRun(){
   try{
-    const d = await api('/api/runs');
+    const q = activeProject ? '/api/runs?project_id='+encodeURIComponent(activeProject.id) : '/api/runs';
+    const d = await api(q);
     if(d.runs.length) selectRun(d.runs[0].id);
   }catch(e){}
 }

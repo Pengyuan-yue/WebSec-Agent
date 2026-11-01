@@ -39,8 +39,14 @@ class ChatIn(BaseModel):
 
 
 class RunIn(BaseModel):
-    target: str
+    target: str | None = None
+    project_id: str | None = None
     use_memory: bool = True
+
+
+class ProjectIn(BaseModel):
+    name: str | None = None
+    urls: list[str] | str | None = None
 
 
 class TranslateIn(BaseModel):
@@ -125,6 +131,73 @@ class Console:
         self._translate_lock = threading.Lock()
         self.state = RunState()
         self._chat_lock = threading.Lock()
+
+    # --------------------------------------------------------------- projects
+    @staticmethod
+    def _clean_urls(urls: list[str] | str | None) -> list[str]:
+        if urls is None:
+            return []
+        raw = urls.splitlines() if isinstance(urls, str) else list(urls)
+        cleaned: list[str] = []
+        for item in raw:
+            url = str(item).strip()
+            if not url:
+                continue
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            if url not in cleaned:
+                cleaned.append(url)
+        return cleaned
+
+    def active_project_id(self) -> str | None:
+        value = load_local().get("active_project_id")
+        if not isinstance(value, str) or not value:
+            return None
+        db, repos = self.db_view()
+        return value if repos.projects.get(value) is not None else None
+
+    def set_active_project(self, project_id: str | None) -> None:
+        local = load_local()
+        if project_id:
+            local["active_project_id"] = project_id
+        else:
+            local.pop("active_project_id", None)
+        save_local(local)
+
+    def projects_view(self) -> dict[str, Any]:
+        db, repos = self.db_view()
+        projects = repos.projects.list_all()
+        active = self.active_project_id()
+        run_map = repos.projects.run_map()
+        counts = {p.id: 0 for p in projects}
+        for project_id in run_map.values():
+            if project_id in counts:
+                counts[project_id] += 1
+        return {
+            "active_project_id": active,
+            "projects": [
+                {**p.to_dict(), "run_count": counts.get(p.id, 0), "active": p.id == active}
+                for p in projects
+            ],
+        }
+
+    def _resolve_project(
+        self, project_id: str | None, target: str
+    ) -> tuple[str | None, list[str]]:
+        """Return (project_id, project_urls); infer the active project when the
+        target belongs to it so chat-launched runs land in the right project."""
+        db, repos = self.db_view()
+        if project_id:
+            project = repos.projects.get(project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="project not found")
+            return project.id, project.urls
+        active = self.active_project_id()
+        if active:
+            project = repos.projects.get(active)
+            if project is not None and target in project.urls:
+                return project.id, project.urls
+        return None, []
 
     # ------------------------------------------------------------ translations
     def _load_translations(self) -> dict[str, Any]:
@@ -368,7 +441,20 @@ class Console:
             self._save_translations()
         return {"cached": False, "items": items}
 
-    def start_run(self, target: str, use_memory: bool) -> dict[str, Any]:
+    def start_run(
+        self, target: str | None, use_memory: bool, project_id: str | None = None
+    ) -> dict[str, Any]:
+        project_id, project_urls = self._resolve_project(project_id, target or "")
+        if not target:
+            if project_urls:
+                target = project_urls[0]
+            else:
+                raise HTTPException(
+                    status_code=400, detail="target URL required (or pass project_id)"
+                )
+        if not target.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="target must be an http(s) URL")
+
         guard = ScopeGuard(self.policy, target)
         if self.allow_hosts:
             guard.expand(self.allow_hosts)
@@ -423,7 +509,14 @@ class Console:
             raise HTTPException(status_code=500, detail="run failed to initialize")
         with self.state.lock:
             self.state.active_run_id = run_id
-        return {"run_id": run_id, "target": target, "use_memory": use_memory}
+        if project_id:
+            repos.projects.attach_run(run_id, project_id)
+        return {
+            "run_id": run_id,
+            "target": target,
+            "use_memory": use_memory,
+            "project_id": project_id,
+        }
 
     def _await_new_run_row(
         self, db: Database, known_ids: set[str], timeout: float
@@ -469,6 +562,11 @@ class Console:
             "(ask for one), or the operator only asked a question. Never "
             "fabricate the marker for hosts other than what the operator "
             "named.\n\n"
+            "PROJECTS: assessments belong to projects. state.active_project "
+            "lists its URLs; when the operator asks to test the project (or names "
+            "any URL of the active project) use the marker with that exact URL "
+            "from state.active_project.urls. Scope is unrestricted: any http(s) "
+            "URL may be tested, including hosts reached through redirects.\n\n"
             "Current console state (JSON):\n" + context
         )
         settings, gateway = ModelRegistry(self.config).resolve(Role.PENTESTER)
@@ -513,9 +611,22 @@ class Console:
 
         state: dict[str, Any] = {
             "active_run": self.state.active_run_id,
+            "unrestricted_scope": bool(self.policy.unrestricted),
             "scope_allowed_hosts": sorted(self.policy.allowed_hosts or []),
             "tools": sorted(self.tools.tools),
         }
+        try:
+            projects = self.projects_view()
+            active_id = projects.get("active_project_id")
+            state["active_project"] = next(
+                (p for p in projects["projects"] if p["id"] == active_id), None
+            )
+            state["projects"] = [
+                {"name": p["name"], "urls": p["urls"], "runs": p["run_count"]}
+                for p in projects["projects"]
+            ]
+        except Exception as exc:  # noqa: BLE001 - context is best-effort
+            state["projects_error"] = str(exc)
         knowledge = self.knowledge.entries_for_all()
         if knowledge:
             state["cross_run_knowledge"] = [
@@ -564,7 +675,7 @@ def create_app(console: Console) -> FastAPI:
     @app.post("/api/runs")
     def launch_run(body: RunIn) -> JSONResponse:
         try:
-            result = console.start_run(body.target, body.use_memory)
+            result = console.start_run(body.target, body.use_memory, body.project_id)
         except ScopeViolation as exc:
             raise HTTPException(status_code=400, detail=f"scope violation: {exc}") from exc
         except ConfigError as exc:
@@ -576,15 +687,71 @@ def create_app(console: Console) -> FastAPI:
         return {
             "active_run_id": console.state.active_run_id,
             "last_error": console.state.error,
+            "unrestricted": bool(console.policy.unrestricted),
             "allowed_hosts": sorted(console.policy.allowed_hosts or []),
             "allow_private": bool(console.policy.allow_private),
             "tools": sorted(console.tools.tools),
+            **console.projects_view(),
         }
 
+    # --------------------------------------------------------------- projects
+    @app.get("/api/projects")
+    def list_projects() -> dict[str, Any]:
+        return console.projects_view()
+
+    @app.post("/api/projects")
+    def create_project(body: ProjectIn) -> dict[str, Any]:
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="项目名称不能为空")
+        urls = console._clean_urls(body.urls)
+        if not urls:
+            raise HTTPException(status_code=400, detail="至少填写一个目标 URL")
+        db, repos = console.db_view()
+        project = repos.projects.create(name, urls)
+        if not console.active_project_id():
+            console.set_active_project(project.id)
+        return {"project": project.to_dict()}
+
+    @app.put("/api/projects/{project_id}")
+    def update_project(project_id: str, body: ProjectIn) -> dict[str, Any]:
+        db, repos = console.db_view()
+        urls = console._clean_urls(body.urls) if body.urls is not None else None
+        name = body.name.strip() if isinstance(body.name, str) and body.name.strip() else None
+        project = repos.projects.update(project_id, name=name, urls=urls)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return {"project": project.to_dict()}
+
+    @app.delete("/api/projects/{project_id}")
+    def delete_project(project_id: str) -> dict[str, Any]:
+        db, repos = console.db_view()
+        if not repos.projects.delete(project_id):
+            raise HTTPException(status_code=404, detail="project not found")
+        if console.active_project_id() is None:
+            console.set_active_project(None)
+        return {"ok": True}
+
+    @app.post("/api/projects/{project_id}/activate")
+    def activate_project(project_id: str) -> dict[str, Any]:
+        db, repos = console.db_view()
+        if repos.projects.get(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        console.set_active_project(project_id)
+        return console.projects_view()
+
+    @app.post("/api/projects/deactivate")
+    def deactivate_project() -> dict[str, Any]:
+        console.set_active_project(None)
+        return console.projects_view()
+
     @app.get("/api/runs")
-    def list_runs() -> dict[str, Any]:
+    def list_runs(project_id: str | None = None) -> dict[str, Any]:
         db, repos = console.db_view()
         runs = repos.runs.list_all()
+        run_map = repos.projects.run_map()
+        if project_id:
+            runs = [r for r in runs if run_map.get(r.id) == project_id]
         return {
             "runs": [
                 {
@@ -593,6 +760,7 @@ def create_app(console: Console) -> FastAPI:
                     "status": r.status.value,
                     "started_at": r.started_at.isoformat(),
                     "stats": r.stats,
+                    "project_id": run_map.get(r.id),
                 }
                 for r in reversed(runs)
             ]

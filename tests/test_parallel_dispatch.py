@@ -11,7 +11,7 @@ from websec_agent.collectors.tls import TLSProbeResult
 from websec_agent.config import RoleModelConfig, ScopePolicy
 from websec_agent.core.schemas import Role, RunBudget, TaskKind, TaskStatus
 from websec_agent.llm.gateway import LLMGateway
-from websec_agent.llm.providers.fake import FakeGateway
+from websec_agent.llm.providers.fake import FakeGateway, json_messages
 from websec_agent.scope.guard import ScopeGuard
 from websec_agent.store.db import Database
 from websec_agent.store.repos import Repositories
