@@ -37,66 +37,26 @@ class StaticRegistry:
         return self._settings, self._gateways[role]
 
 
-def test_parallel_dispatch_overlaps_llm_calls(tmp_path):
-    """Two independent analysis tasks must run their LLM turns concurrently."""
-    barrier = threading.Barrier(2, timeout=15)
-    overlaps = {"analyze": 0}
-
-    def planner(_request) -> str:
-        return json.dumps(
-            {
-                "rationale": "Two independent probes.",
-                "tasks": [
-                    {
-                        "key": "probe-a",
-                        "kind": "analyze",
-                        "role": "pentester",
-                        "objective": "Analyze area A.",
-                        "inputs": {},
-                        "depends_on": [],
-                        "priority": 50,
-                    },
-                    {
-                        "key": "probe-b",
-                        "kind": "analyze",
-                        "role": "pentester",
-                        "objective": "Analyze area B.",
-                        "inputs": {},
-                        "depends_on": [],
-                        "priority": 50,
-                    },
-                ],
-            }
-        )
+def test_four_pentesters_run_in_parallel(tmp_path):
+    """The four fixed Pentester lanes must overlap, without planner/reviewer/reporter calls."""
+    barrier = threading.Barrier(4, timeout=15)
+    count_lock = threading.Lock()
+    overlaps = {"pentester": 0}
 
     def pentester(_request) -> str:
-        # Only the two plan-created analysis tasks should meet at the barrier;
-        # the fallback/cycle-2 tasks (if any) would break the barrier count.
-        try:
-            barrier.wait(timeout=15)
-            overlaps["analyze"] += 1
-        except threading.BrokenBarrierError:
-            pass
+        barrier.wait(timeout=15)
+        with count_lock:
+            overlaps["pentester"] += 1
         return json.dumps(
             {"summary": "Nothing severe found.", "findings": [], "tool_requests": []}
         )
 
-    def reporter(_request) -> str:
-        return json.dumps({"summary_markdown": "Parallel fixture."})
-
-    registry = StaticRegistry(
-        {
-            Role.PLANNER: FakeGateway(planner),
-            Role.PENTESTER: FakeGateway(pentester),
-            Role.REPORTER: FakeGateway(reporter),
-        }
-    )
+    registry = StaticRegistry({Role.PENTESTER: FakeGateway(pentester)})
 
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     db = Database(f"sqlite+pysqlite:///{tmp_path / 'run.db'}")
-    policy = ScopePolicy(allowed_hosts=["example.com"])
-    guard = ScopeGuard(policy, TARGET)
+    guard = ScopeGuard(ScopePolicy(allowed_hosts=["example.com"]), TARGET)
     repos = Repositories.build(db)
     db.create_all()
     executor = ToolExecutor(
@@ -118,23 +78,27 @@ def test_parallel_dispatch_overlaps_llm_calls(tmp_path):
     run = orchestrator.run()
     executor.close()
 
-    # The barrier was met: both analysis LLM turns were in flight simultaneously.
-    assert overlaps["analyze"] == 2, "independent analysis tasks did not overlap"
+    assert overlaps["pentester"] == 4
 
     tasks = repos.tasks.list_by_run(run.id)
     failures = [(t.kind.value, t.error) for t in tasks if t.status != TaskStatus.DONE]
     assert not failures, failures
 
-    events = repos.events.list_by_run(run.id)
-    parallel_events = [e for e in events if e.type == "dispatch_parallel"]
-    assert parallel_events, "no parallel dispatch happened"
-    analysis_parallel = [
-        e
-        for e in parallel_events
-        if set(e.payload.get("kinds", [])) == {"analyze"}
+    pentester_tasks = [
+        task for task in tasks
+        if task.kind == TaskKind.ANALYZE and task.inputs.get("pentester_slot")
     ]
-    assert analysis_parallel, "the two analysis tasks were not batched together"
+    assert len(pentester_tasks) == 4
+    assert {task.inputs["pentester_label"] for task in pentester_tasks} == {
+        "Pentester 1", "Pentester 2", "Pentester 3", "Pentester 4"
+    }
 
-    kinds = Counter(t.kind.value for t in tasks)
-    assert kinds["analyze"] == 2
+    events = repos.events.list_by_run(run.id)
+    parallel_events = [event for event in events if event.type == "dispatch_parallel"]
+    assert any(set(event.payload.get("kinds", [])) == {"analyze"} for event in parallel_events)
+
+    kinds = Counter(task.kind.value for task in tasks)
+    assert kinds["analyze"] == 4
     assert kinds["report"] == 1
+    assert kinds["plan"] == 0
+    assert kinds["review"] == 0
