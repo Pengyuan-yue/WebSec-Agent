@@ -62,10 +62,10 @@ def test_four_pentesters_run_in_parallel(tmp_path):
             {
                 "summary": "Keep the four workers on distinct responsibility areas.",
                 "assignments": [
-                    {"slot": 1, "focus": ["public surface and configuration"], "avoid": ["identity workflows"], "guidance": "Stay within the assigned area."},
-                    {"slot": 2, "focus": ["identity and access boundaries"], "avoid": ["public configuration inventory"], "guidance": "Use only evidence already in scope."},
-                    {"slot": 3, "focus": ["server-side input handling"], "avoid": ["browser presentation review"], "guidance": "Prefer distinct evidence."},
-                    {"slot": 4, "focus": ["browser behavior and workflow logic"], "avoid": ["server-side input review"], "guidance": "Avoid repeating completed checks."},
+                    {"slot": 1, "objective": "Assess the externally visible service configuration and public-facing security controls, avoiding identity workflow checks.", "focus": ["public surface and configuration"], "avoid": ["identity workflows"], "guidance": "Stay within the assigned area."},
+                    {"slot": 2, "objective": "Assess identity lifecycle, session integrity, and access-control boundaries; avoid duplicating public configuration inventory.", "focus": ["identity and access boundaries"], "avoid": ["public configuration inventory"], "guidance": "Use only evidence already in scope."},
+                    {"slot": 3, "objective": "Assess server-side handling of user-controlled data and API request boundaries; avoid browser rendering and identity review.", "focus": ["server-side input handling"], "avoid": ["browser presentation review"], "guidance": "Prefer distinct evidence."},
+                    {"slot": 4, "objective": "Assess browser-visible behavior and business workflow boundaries; avoid server-side input and public configuration reviews.", "focus": ["browser behavior and workflow logic"], "avoid": ["server-side input review"], "guidance": "Avoid repeating completed checks."},
                 ],
                 "overlap_warnings": [],
             }
@@ -122,6 +122,8 @@ def test_four_pentesters_run_in_parallel(tmp_path):
         "Pentester 1", "Pentester 2", "Pentester 3", "Pentester 4"
     }
     assert all("supervisor_directive" in task.inputs for task in pentester_tasks)
+    assert all(task.objective == task.inputs["supervisor_directive"]["objective"] for task in pentester_tasks)
+    assert len({task.objective for task in pentester_tasks}) == 4
 
     events = repos.events.list_by_run(run.id)
     parallel_events = [event for event in events if event.type == "dispatch_parallel"]
