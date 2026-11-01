@@ -477,7 +477,7 @@ function flowTask(tid){
   const el = document.createElement('div');
   el.className = 'fl';
   const st = info.status==='done' ? 'done' : (info.status==='failed' ? 'fail' : 'run');
-  el.innerHTML = `<span class="fl-b">⏺</span><span class="fl-k">${t(KIND, info.kind||'')}</span><span class="fl-o">${esc((info.objective||'').slice(0,64))}</span><span class="fl-st ${st}">${st==='done'?'✓':(st==='fail'?'✗':'✻')}</span><span class="fl-ev"></span><div class="fl-err"></div>`;
+  el.innerHTML = `<span class="fl-b">⏺</span><span class="fl-k">${t(KIND, info.kind||'')}</span>${info.agent ? `<span class="fl-k">${esc(info.agent)}</span>` : ''}<span class="fl-o">${esc((info.objective||'').slice(0,64))}</span><span class="fl-st ${st}">${st==='done'?'✓':(st==='fail'?'✗':'✻')}</span><span class="fl-ev"></span><div class="fl-err"></div>`;
   $('events').appendChild(el);
   const stEl = el.querySelector('.fl-st'), evEl = el.querySelector('.fl-ev'), errEl = el.querySelector('.fl-err');
   const handler = {
@@ -525,7 +525,7 @@ function renderFlowEvent(e){
       break;
     }
     case 'dispatch_parallel':
-      flowNote(`并行执行 <b>${(p.kinds||[]).length}</b> 个任务（${(p.kinds||[]).map(k=>t(KIND,k)).join('、')}）`, 'parallel'); break;
+      flowNote(`并行执行 <b>${(p.agents||[]).length || (p.kinds||[]).length}</b> 个 Pentester 任务（${(p.agents||[]).map(esc).join('、') || (p.kinds||[]).map(k=>t(KIND,k)).join('、')}）`, 'parallel'); break;
     case 'plan_cycle_created':
       flowNote(`证据持续增长，启动第 <b>${p.cycle}</b> 轮迭代规划（证据 ${p.evidence_before||0} → ${p.evidence_now||'…'}）`, 'cycle'); break;
     case 'oast_started':
@@ -548,7 +548,7 @@ async function pollEvents(force){
     if(force || !Object.keys(taskMap).length){
       const detail = await api('/api/runs/'+selectedRun);
       taskMap = {};
-      detail.tasks.forEach(tk=>{ taskMap[tk.id] = {kind: tk.kind, objective: tk.objective, status: tk.status}; });
+      detail.tasks.forEach(tk=>{ taskMap[tk.id] = {kind: tk.kind, objective: tk.objective, status: tk.status, agent: tk.agent}; });
     }
     const data = await api(`/api/runs/${selectedRun}/events?after=${evCount}`);
     evCount = data.total;
@@ -571,7 +571,7 @@ async function loadFindings(){
   try{
     const d = await api('/api/runs/'+selectedRun);
     taskMap = {};
-    d.tasks.forEach(tk=>{ taskMap[tk.id] = {kind: tk.kind, objective: tk.objective, status: tk.status}; });
+    d.tasks.forEach(tk=>{ taskMap[tk.id] = {kind: tk.kind, objective: tk.objective, status: tk.status, agent: tk.agent}; });
     const old = window._findings || [];
     d.findings.forEach(f=>{ const prev = old.find(x=>x.id===f.id); if(prev && prev._zh){ f._zh = prev._zh; f._zhBusy = prev._zhBusy; } });
     window._findings = d.findings;
