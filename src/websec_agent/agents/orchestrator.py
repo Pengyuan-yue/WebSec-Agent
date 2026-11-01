@@ -18,11 +18,7 @@ from ..core.schemas import (
     Finding,
     FindingStatus,
     FindingSummary,
-    PlanOutput,
     ProposedFinding,
-    ReviewOutput,
-    ReviewRecord,
-    ReviewVerdictValue,
     Role,
     Run,
     RunBudget,
@@ -47,9 +43,6 @@ from ..tools.oast import OastChannel
 from .auditor import EvidenceAuditor
 from .context import compress_evidence, compress_list
 from .pentester import PentesterAgent
-from .planner import PlannerAgent
-from .reporter import ReporterAgent
-from .reviewer import ReviewerAgent
 
 ANALYSIS_KINDS = {TaskKind.ANALYZE, TaskKind.EXPLOIT, TaskKind.VALIDATE}
 ACTIVE_STATUSES = {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}
@@ -58,18 +51,14 @@ MAX_EXCERPT_CHARS = 200_000
 MAX_CONTEXT_TASKS = 20
 MAX_TOOL_REQUESTS_PER_TURN = 3
 MAX_PROBES_PER_ENDPOINT = 3
-MAX_REWORKS_PER_FINDING = 2
-MAX_PLAN_CYCLES = 2
 # Kinds safe to dispatch concurrently: their handlers are LLM-bound (pure
 # network I/O) or subprocess-bound; all DB access is serialized by the
 # Database session lock. AUDIT and REPORT stay exclusive.
 PARALLEL_KINDS = {
-    TaskKind.PLAN,
     TaskKind.RECON,
     TaskKind.ANALYZE,
     TaskKind.EXPLOIT,
     TaskKind.VALIDATE,
-    TaskKind.REVIEW,
 }
 CONTEXT_CHARS_PER_TOKEN = 3.5
 CONTEXT_BUDGET_RATIO = 0.95
@@ -137,7 +126,7 @@ class Orchestrator:
         self._start_oast(run.id)
 
         pool = ThreadPoolExecutor(
-            max_workers=self._run_budget.max_parallel, thread_name_prefix="websec-dispatch"
+            max_workers=max(4, self._run_budget.max_parallel), thread_name_prefix="websec-dispatch"
         )
         try:
             while True:
@@ -147,8 +136,6 @@ class Orchestrator:
 
                 ready = self._repos.tasks.list_by_status(run.id, TaskStatus.READY)
                 if not ready:
-                    if self._maybe_expand_plan(run.id):
-                        continue
                     if self._ensure_report_task(run.id):
                         continue
                     break
@@ -165,14 +152,22 @@ class Orchestrator:
                     task
                     for task in ready
                     if task.kind in PARALLEL_KINDS
-                ][: self._run_budget.max_parallel]
+                ][: max(4, self._run_budget.max_parallel)]
                 if len(batch) <= 1:
                     self._dispatch(ready[0])
                     continue
                 self._event(
                     run.id,
                     "dispatch_parallel",
-                    {"task_ids": [task.id for task in batch], "kinds": [t.kind.value for t in batch]},
+                    {
+                        "task_ids": [task.id for task in batch],
+                        "kinds": [t.kind.value for t in batch],
+                        "agents": [
+                            t.inputs.get("pentester_label")
+                            for t in batch
+                            if t.inputs.get("pentester_label")
+                        ],
+                    },
                 )
                 futures = [pool.submit(self._dispatch, task) for task in batch]
                 for future in as_completed(futures):
@@ -261,6 +256,7 @@ class Orchestrator:
 
     # --------------------------------------------------------------- seeding
 
+
     def _seed_initial_tasks(self, run_id: str) -> None:
         url = self._target
         origin = f"{self._target_scheme}://{urlparse(url).netloc}"
@@ -269,7 +265,9 @@ class Orchestrator:
             (
                 "Baseline HTTP fetch of the target",
                 ToolRequest(
-                    tool=ToolName.HTTP_REQUEST, params={"url": url, "method": "GET"}, reason="baseline"
+                    tool=ToolName.HTTP_REQUEST,
+                    params={"url": url, "method": "GET"},
+                    reason="baseline",
                 ),
             ),
         ]
@@ -286,22 +284,25 @@ class Orchestrator:
                 )
             )
 
-        recon_specs.append(
-            (
-                "Fetch robots.txt",
-                ToolRequest(
-                    tool=ToolName.ROBOTS, params={"url": f"{origin}/robots.txt"}, reason="baseline"
+        recon_specs.extend(
+            [
+                (
+                    "Fetch robots.txt",
+                    ToolRequest(
+                        tool=ToolName.ROBOTS,
+                        params={"url": f"{origin}/robots.txt"},
+                        reason="baseline",
+                    ),
                 ),
-            )
-        )
-
-        recon_specs.append(
-            (
-                "Resolve target DNS records",
-                ToolRequest(
-                    tool=ToolName.DNS_LOOKUP, params={"host": self._target_host}, reason="baseline"
+                (
+                    "Resolve target DNS records",
+                    ToolRequest(
+                        tool=ToolName.DNS_LOOKUP,
+                        params={"host": self._target_host},
+                        reason="baseline",
+                    ),
                 ),
-            )
+            ]
         )
 
         recon_ids: list[str] = []
@@ -318,21 +319,37 @@ class Orchestrator:
             )
             recon_ids.append(task.id)
 
-        self._create_task(
-            run_id,
-            kind=TaskKind.PLAN,
-            role=Role.PLANNER,
-            objective=(
-                "Plan a security assessment that finds ALL high-severity vulnerabilities "
-                "(critical and high) in the target. Medium and lower severity are out of scope."
+        # Four independent Pentester workers start together after baseline recon.
+        # They share the existing Pentester prompt and model configuration.
+        pentester_lanes = [
+            (
+                "Pentester 1",
+                "Assess the externally visible surface, baseline configuration, exposed resources, and high-impact misconfigurations.",
             ),
-            inputs={},
-            depends_on=recon_ids,
-            priority=70,
-            status=TaskStatus.PENDING,
-        )
-
-    # ------------------------------------------------------------ task state
+            (
+                "Pentester 2",
+                "Assess authentication, session handling, and authorization boundaries using the available evidence and application flows.",
+            ),
+            (
+                "Pentester 3",
+                "Assess server-side request handling, user-controlled inputs, and API behavior for high-impact security issues.",
+            ),
+            (
+                "Pentester 4",
+                "Assess browser-visible functionality, client-side behavior, API interactions, and high-impact business-logic boundaries.",
+            ),
+        ]
+        for slot, (label, objective) in enumerate(pentester_lanes, start=1):
+            self._create_task(
+                run_id,
+                kind=TaskKind.ANALYZE,
+                role=Role.PENTESTER,
+                objective=objective,
+                inputs={"pentester_slot": slot, "pentester_label": label},
+                depends_on=recon_ids,
+                priority=70,
+                status=TaskStatus.PENDING,
+            )
 
     def _create_task(
         self,
@@ -369,6 +386,7 @@ class Orchestrator:
                 "kind": kind.value,
                 "role": role.value,
                 "status": status.value,
+                "agent": inputs.get("pentester_label"),
             },
             task_id=task.id,
         )
@@ -391,14 +409,6 @@ class Orchestrator:
         task.error = reason
         self._update_task(task, TaskStatus.SKIPPED, reason)
 
-    def _is_freshly_reviewed(self, run_id: str, finding: Finding) -> bool:
-        """True when the finding has a review newer than its last content update."""
-        reviews = self._repos.reviews.list_for_finding(run_id, finding.id)
-        if not reviews:
-            return False
-        last_review_at = max(review.created_at for review in reviews)
-        return last_review_at >= finding.updated_at
-
     def _refresh_dependencies(self, run_id: str) -> None:
         tasks = self._repos.tasks.list_by_run(run_id)
         by_id = {task.id: task for task in tasks}
@@ -414,61 +424,56 @@ class Orchestrator:
 
     # ------------------------------------------------------------- scheduling
 
+
     def _schedule_followups(self, run_id: str) -> None:
+        """Schedule one deterministic evidence-integrity audit after Pentester work settles."""
         tasks = self._repos.tasks.list_by_run(run_id)
         findings = self._repos.findings.list_by_run(run_id)
         audited_ids = self._repos.audits.audited_finding_ids(run_id)
 
-        active_review = any(
-            task.kind == TaskKind.REVIEW and task.status in ACTIVE_STATUSES for task in tasks
+        active_work = any(
+            task.kind in (ANALYSIS_KINDS | {TaskKind.RECON})
+            and task.status in ACTIVE_STATUSES
+            for task in tasks
         )
         active_audit = any(
             task.kind == TaskKind.AUDIT and task.status in ACTIVE_STATUSES for task in tasks
         )
+        if active_work or active_audit:
+            return
 
-        unreviewed = [
-            finding
-            for finding in findings
-            if finding.status == FindingStatus.PROPOSED
-            and not self._is_freshly_reviewed(run_id, finding)
-        ]
-        if unreviewed and not active_review:
-            analysis_ids = [
-                task.id
-                for task in tasks
-                if task.kind in ANALYSIS_KINDS and task.status != TaskStatus.SKIPPED
-            ]
-            self._create_task(
-                run_id,
-                kind=TaskKind.REVIEW,
-                role=Role.REVIEWER,
-                objective="Independently review proposed findings against collected evidence.",
-                inputs={"finding_ids": [finding.id for finding in unreviewed]},
-                depends_on=analysis_ids,
-                priority=60,
-            )
-
+        attempted_ids = {
+            finding_id
+            for task in tasks
+            if task.kind == TaskKind.AUDIT
+            for finding_id in (task.inputs.get("finding_ids") or [])
+        }
         unaudited = [
             finding
             for finding in findings
             if finding.status in {FindingStatus.CONFIRMED, FindingStatus.UNCERTAIN}
             and finding.id not in audited_ids
+            and finding.id not in attempted_ids
         ]
-        if unaudited and not unreviewed and not active_review and not active_audit:
-            review_ids = [
-                task.id
-                for task in tasks
-                if task.kind == TaskKind.REVIEW and task.status == TaskStatus.DONE
-            ]
-            self._create_task(
-                run_id,
-                kind=TaskKind.AUDIT,
-                role=Role.AUDITOR,
-                objective="Programmatically audit evidence hashes, scope flags and finding completeness.",
-                inputs={"finding_ids": [finding.id for finding in unaudited]},
-                depends_on=review_ids,
-                priority=58,
-            )
+        if not unaudited:
+            return
+
+        work_ids = [
+            task.id
+            for task in tasks
+            if task.kind in (ANALYSIS_KINDS | {TaskKind.RECON})
+            and task.status != TaskStatus.SKIPPED
+        ]
+        self._create_task(
+            run_id,
+            kind=TaskKind.AUDIT,
+            role=Role.AUDITOR,
+            objective="Programmatically audit evidence hashes, scope flags and finding completeness.",
+            inputs={"finding_ids": [finding.id for finding in unaudited]},
+            depends_on=work_ids,
+            priority=58,
+        )
+
 
     def _ensure_report_task(self, run_id: str) -> bool:
         tasks = self._repos.tasks.list_by_run(run_id)
@@ -477,85 +482,23 @@ class Orchestrator:
         self._create_task(
             run_id,
             kind=TaskKind.REPORT,
-            role=Role.REPORTER,
-            objective="Generate the structured report and executive summary.",
+            role=Role.SYSTEM,
+            objective="Generate the report deterministically from persisted evidence and findings.",
             inputs={},
             depends_on=[task.id for task in tasks],
             priority=5,
         )
         return True
 
-    def _maybe_expand_plan(self, run_id: str) -> bool:
-        """Iterative planning: once a cycle quiets down, plan the next wave.
-
-        Fires only when every task is terminal, evidence has grown since the
-        last plan ran, and the budget still has room. Capped at MAX_PLAN_CYCLES
-        plan tasks per run so the loop always terminates.
-        """
-        tasks = self._repos.tasks.list_by_run(run_id)
-        if any(task.status in ACTIVE_STATUSES for task in tasks):
-            return False
-        if any(task.kind == TaskKind.REPORT for task in tasks):
-            return False
-        plan_tasks = [task for task in tasks if task.kind == TaskKind.PLAN]
-        if len(plan_tasks) >= MAX_PLAN_CYCLES:
-            return False
-        if self._budget is None or self._budget.exhaustion_reason():
-            return False
-
-        latest_plan = plan_tasks[-1]
-        evidence_before = int((latest_plan.result or {}).get("evidence_count") or 0)
-        evidence_now = self._repos.evidence.count_by_run(run_id)
-        if evidence_now <= evidence_before:
-            return False
-
-        findings = self._repos.findings.list_by_run(run_id)
-        confirmed = sum(1 for f in findings if f.status == FindingStatus.CONFIRMED)
-        cycle = len(plan_tasks) + 1
-        self._create_task(
-            run_id,
-            kind=TaskKind.PLAN,
-            role=Role.PLANNER,
-            objective=(
-                f"Extend the assessment (plan cycle {cycle} of {MAX_PLAN_CYCLES}). The previous "
-                f"cycle finished with {evidence_now} evidence items and {len(findings)} finding(s) "
-                f"({confirmed} confirmed). Review the new evidence and findings in context and "
-                "plan the NEXT wave of tasks to expand the attack surface: endpoints not yet "
-                "probed, deeper exploitation chains (e.g. authenticated traversal, IDOR with the "
-                "confirmed access), and lateral follow-ups of partially-explored areas. Do not "
-                "re-plan work already covered by confirmed findings."
-            ),
-            inputs={"plan_cycle": cycle, "previous_plan_task": latest_plan.id},
-            depends_on=[],
-            priority=70,
-            status=TaskStatus.READY,
-        )
-        self._event(
-            run_id,
-            "plan_cycle_created",
-            {
-                "cycle": cycle,
-                "previous_plan_task": latest_plan.id,
-                "evidence_before": evidence_before,
-                "evidence_now": evidence_now,
-            },
-        )
-        return True
-
-    # --------------------------------------------------------------- dispatch
 
     def _dispatch(self, task: Task) -> None:
         task.attempts += 1
         self._update_task(task, TaskStatus.RUNNING)
         try:
-            if task.kind == TaskKind.PLAN:
-                result = self._handle_plan(task)
-            elif task.kind == TaskKind.RECON:
+            if task.kind == TaskKind.RECON:
                 result = self._handle_recon(task)
             elif task.kind in ANALYSIS_KINDS:
                 result = self._handle_pentest(task)
-            elif task.kind == TaskKind.REVIEW:
-                result = self._handle_review(task)
             elif task.kind == TaskKind.AUDIT:
                 result = self._handle_audit(task)
             elif task.kind == TaskKind.REPORT:
@@ -584,108 +527,6 @@ class Orchestrator:
             )
 
     # ---------------------------------------------------------------- handlers
-
-    def _handle_plan(self, task: Task) -> dict[str, Any]:
-        output: PlanOutput = self._call_agent(PlannerAgent(), task, self._context(task))
-        evidence_count = self._repos.evidence.count_by_run(task.run_id)
-        key_to_id: dict[str, str] = {}
-        created = 0
-        allowed_roles = {Role.PENTESTER}
-
-        if not output.tasks:
-            self._event(
-                task.run_id,
-                "plan_empty",
-                {"rationale": output.rationale[:300]},
-                task_id=task.id,
-            )
-            child = self._create_task(
-                task.run_id,
-                kind=TaskKind.ANALYZE,
-                role=Role.PENTESTER,
-                objective=(
-                    "Analyze all collected recon evidence, identify high-severity attack "
-                    "surface (login, search, API, admin paths), and test it with http_request "
-                    "or external_tool probes."
-                ),
-                inputs={},
-                depends_on=[task.id],
-                priority=50,
-                parent_id=task.id,
-            )
-            key_to_id["fallback-analysis"] = child.id
-            created += 1
-            return {
-                "rationale": output.rationale,
-                "planned_keys": key_to_id,
-                "tasks_created": created,
-                "tasks_proposed": 0,
-                "empty_plan_fallback": True,
-                "evidence_count": evidence_count,
-            }
-
-        for planned in output.tasks:
-            if planned.key in key_to_id:
-                self._event(
-                    task.run_id,
-                    "plan_task_rejected",
-                    {"feature": "duplicate_key", "value": planned.key},
-                    task_id=task.id,
-                )
-                continue
-            if planned.kind not in {TaskKind.RECON, TaskKind.ANALYZE, TaskKind.EXPLOIT, TaskKind.VALIDATE}:
-                self._event(
-                    task.run_id,
-                    "plan_task_rejected",
-                    {"feature": "kind", "value": planned.kind.value, "key": planned.key},
-                    task_id=task.id,
-                )
-                continue
-            if planned.role not in allowed_roles:
-                self._event(
-                    task.run_id,
-                    "plan_task_rejected",
-                    {"feature": "role", "value": planned.role.value, "key": planned.key},
-                    task_id=task.id,
-                )
-                continue
-            resolved_deps: list[str] = []
-            invalid_dep = None
-            for key in planned.depends_on:
-                if key not in key_to_id:
-                    invalid_dep = key
-                    break
-                resolved_deps.append(key_to_id[key])
-            if invalid_dep is not None:
-                self._event(
-                    task.run_id,
-                    "plan_task_rejected",
-                    {"feature": "depends_on", "value": invalid_dep, "key": planned.key},
-                    task_id=task.id,
-                )
-                continue
-
-            child = self._create_task(
-                task.run_id,
-                kind=planned.kind,
-                role=planned.role,
-                objective=planned.objective,
-                inputs=planned.inputs,
-                depends_on=resolved_deps + [task.id],
-                priority=planned.priority,
-                parent_id=task.id,
-                budget=planned.budget,
-            )
-            key_to_id[planned.key] = child.id
-            created += 1
-
-        return {
-            "rationale": output.rationale,
-            "planned_keys": key_to_id,
-            "tasks_created": created,
-            "tasks_proposed": len(output.tasks),
-            "evidence_count": evidence_count,
-        }
 
     def _handle_recon(self, task: Task) -> dict[str, Any]:
         raw_request = task.inputs.get("request")
@@ -805,7 +646,7 @@ class Orchestrator:
             evidence_ids=evidence_ids,
             reproduction=proposed.reproduction,
             remediation=proposed.remediation,
-            status=FindingStatus.PROPOSED,
+            status=FindingStatus.CONFIRMED,
             created_by=Role.PENTESTER,
         )
         self._repos.findings.create(finding)
@@ -946,6 +787,9 @@ class Orchestrator:
                 " citing the existing evidence, or state precisely what decisive signal is missing."
             )
         followup_inputs = {"followup": True, "origin_task": task.id, "origin_objective": task.objective}
+        for key in ("pentester_slot", "pentester_label"):
+            if key in task.inputs:
+                followup_inputs[key] = task.inputs[key]
         if isinstance(task.inputs.get("rework_finding_id"), str):
             followup_inputs["rework_finding_id"] = task.inputs["rework_finding_id"]
             followup_inputs["missing_evidence"] = task.inputs.get("missing_evidence", [])
@@ -967,151 +811,6 @@ class Orchestrator:
             task_id=task.id,
         )
         return child_ids, followup.id
-
-    def _handle_review(self, task: Task) -> dict[str, Any]:
-        target_ids = list(task.inputs.get("finding_ids") or [])
-        findings = [
-            finding
-            for finding in (self._repos.findings.get(task.run_id, fid) for fid in target_ids)
-            if finding is not None
-        ]
-        if not findings:
-            return {"verdicts": 0, "note": "no findings to review"}
-
-        output: ReviewOutput = self._call_agent(
-            ReviewerAgent(), task, self._context(task, findings_override=findings)
-        )
-
-        with self._persist_lock:
-            seen: set[str] = set()
-            counts: dict[str, int] = {}
-            needs_evidence_items: list[tuple[Any, Finding]] = []
-            status_map = {
-                ReviewVerdictValue.CONFIRM: FindingStatus.CONFIRMED,
-                ReviewVerdictValue.REJECT: FindingStatus.REJECTED,
-                ReviewVerdictValue.NEEDS_EVIDENCE: FindingStatus.UNCERTAIN,
-            }
-            for verdict in output.verdicts:
-                if verdict.finding_id not in target_ids or verdict.finding_id in seen:
-                    self._event(
-                        task.run_id,
-                        "review_verdict_ignored",
-                        {"finding_id": verdict.finding_id},
-                        task_id=task.id,
-                    )
-                    continue
-                seen.add(verdict.finding_id)
-                review = ReviewRecord(
-                    run_id=task.run_id,
-                    task_id=task.id,
-                    finding_id=verdict.finding_id,
-                    verdict=verdict.verdict,
-                    rationale=verdict.rationale,
-                    cited_evidence_ids=verdict.cited_evidence_ids,
-                    missing_evidence=verdict.missing_evidence,
-                )
-                self._repos.reviews.create(review)
-                counts[verdict.verdict.value] = counts.get(verdict.verdict.value, 0) + 1
-                finding = self._repos.findings.get(task.run_id, verdict.finding_id)
-                if finding is not None:
-                    new_status = status_map[verdict.verdict]
-                    self._repos.findings.set_status(task.run_id, finding.id, new_status)
-                    self._event(
-                        task.run_id,
-                        "finding_status_changed",
-                        {
-                            "finding_id": finding.id,
-                            "status": new_status.value,
-                            "source": "review",
-                        },
-                        task_id=task.id,
-                    )
-                    if verdict.verdict is ReviewVerdictValue.NEEDS_EVIDENCE:
-                        needs_evidence_items.append((verdict, finding))
-
-            for finding_id in target_ids:
-                if finding_id in seen:
-                    continue
-                finding = self._repos.findings.get(task.run_id, finding_id)
-                if finding is None:
-                    continue
-                self._repos.findings.set_status(task.run_id, finding_id, FindingStatus.UNCERTAIN)
-                self._event(
-                    task.run_id,
-                    "finding_status_changed",
-                    {"finding_id": finding_id, "status": "uncertain", "source": "review_missing"},
-                    task_id=task.id,
-                )
-
-            rework_task_ids = self._create_rework_tasks(task, needs_evidence_items)
-
-            return {
-                "verdicts": len(seen),
-                "counts": counts,
-                "notes": output.notes,
-                "rework_task_ids": rework_task_ids,
-            }
-
-    def _create_rework_tasks(
-        self, task: Task, needs_evidence_items: list[tuple[Any, Finding]]
-    ) -> list[str]:
-        """Turn needs_evidence verdicts into pentester rework tasks (bounded)."""
-        rework_ids: list[str] = []
-        for verdict, finding in needs_evidence_items:
-            reviews = self._repos.reviews.list_for_finding(task.run_id, finding.id)
-            sendbacks = sum(
-                1 for review in reviews if review.verdict is ReviewVerdictValue.NEEDS_EVIDENCE
-            )
-            if sendbacks > MAX_REWORKS_PER_FINDING:
-                self._event(
-                    task.run_id,
-                    "rework_limit_reached",
-                    {
-                        "finding_id": finding.id,
-                        "sendbacks": sendbacks,
-                        "limit": MAX_REWORKS_PER_FINDING,
-                    },
-                    task_id=task.id,
-                )
-                continue
-
-            missing = "; ".join(verdict.missing_evidence) if verdict.missing_evidence else "see rationale"
-            rework = self._create_task(
-                task.run_id,
-                kind=TaskKind.VALIDATE,
-                role=Role.PENTESTER,
-                objective=(
-                    f"Rework finding '{finding.title}' (severity {finding.severity.value}): "
-                    "the independent reviewer judged the current evidence insufficient. "
-                    f"Reviewer rationale: {verdict.rationale} "
-                    f"Missing evidence: {missing}. "
-                    "Collect exactly the missing decisive evidence, then resubmit the SAME finding "
-                    "(same title and category) so the new evidence IDs are merged into it for "
-                    "re-review. If the evidence cannot be collected, explain precisely why in "
-                    "your summary."
-                ),
-                inputs={
-                    "rework_finding_id": finding.id,
-                    "review_rationale": verdict.rationale,
-                    "missing_evidence": list(verdict.missing_evidence),
-                    "rework_attempt": sendbacks,
-                },
-                depends_on=[task.id],
-                priority=55,
-                parent_id=task.id,
-            )
-            rework_ids.append(rework.id)
-            self._event(
-                task.run_id,
-                "rework_created",
-                {
-                    "finding_id": finding.id,
-                    "rework_task_id": rework.id,
-                    "attempt": sendbacks,
-                },
-                task_id=task.id,
-            )
-        return rework_ids
 
     def _handle_audit(self, task: Task) -> dict[str, Any]:
         target_ids = list(task.inputs.get("finding_ids") or [])
@@ -1146,6 +845,7 @@ class Orchestrator:
         )
         return output.model_dump(mode="json")
 
+
     def _handle_report(self, task: Task) -> dict[str, Any]:
         run = self._repos.runs.get(task.run_id)
         if run is None:
@@ -1159,68 +859,26 @@ class Orchestrator:
         tasks = self._repos.tasks.list_by_run(task.run_id)
         events = self._repos.events.list_by_run(task.run_id)
 
-        summary_generated = False
-        summary = ""
-        exhaustion = self._budget.exhaustion_reason() if self._budget else None
-        if exhaustion is None:
-            try:
-                report_context = {
-                    "target": self._target,
-                    "findings": [
-                        self._finding_summary(finding).model_dump(mode="json")
-                        for finding in findings
-                    ],
-                    "reviews": [
-                        {
-                            "finding_id": review.finding_id,
-                            "verdict": review.verdict.value,
-                            "rationale": review.rationale,
-                        }
-                        for review in reviews
-                    ],
-                    "failed_audits": [
-                        {"finding_id": check.finding_id, "check": check.check, "detail": check.detail}
-                        for check in audits
-                        if not check.passed
-                    ],
-                    "task_stats": compute_stats(tasks, evidence, findings, calls),
-                    "failed_tasks": [
-                        {"kind": item.kind.value, "objective": item.objective, "error": item.error}
-                        for item in tasks
-                        if item.status == TaskStatus.FAILED
-                    ],
-                    "skipped_tasks": [
-                        {"kind": item.kind.value, "objective": item.objective, "error": item.error}
-                        for item in tasks
-                        if item.status == TaskStatus.SKIPPED
-                    ],
-                    "budget": self._run_budget.model_dump(),
-                }
-                output = self._call_agent(ReporterAgent(), task, report_context)
-                summary = output.summary_markdown
-                summary_generated = True
-            except Exception as exc:  # noqa: BLE001 - report must still be written
-                self._event(
-                    task.run_id,
-                    "report_llm_failed",
-                    {"error": str(exc)[:500]},
-                    task_id=task.id,
-                )
+        confirmed = sum(1 for finding in findings if finding.status == FindingStatus.CONFIRMED)
+        uncertain = sum(1 for finding in findings if finding.status == FindingStatus.UNCERTAIN)
+        rejected = sum(
+            1
+            for finding in findings
+            if finding.status in {FindingStatus.REJECTED, FindingStatus.DUPLICATE}
+        )
+        failed = sum(1 for item in tasks if item.status == TaskStatus.FAILED)
+        skipped = sum(1 for item in tasks if item.status == TaskStatus.SKIPPED)
+        summary = (
+            f"本次对目标 {self._target} 的安全评估共形成 {len(findings)} 项发现："
+            f"已确认 {confirmed} 项，待核实 {uncertain} 项，已排除 {rejected} 项。"
+        )
+        if failed or skipped:
+            summary += (
+                f" 执行过程中有 {failed} 个任务失败、{skipped} 个任务因预算或依赖原因跳过，"
+                "分析完整性需结合任务记录判断。"
+            )
         else:
-            self._event(
-                task.run_id,
-                "report_llm_skipped",
-                {"reason": exhaustion},
-                task_id=task.id,
-            )
-
-        if not summary:
-            confirmed = sum(1 for finding in findings if finding.status == FindingStatus.CONFIRMED)
-            summary = (
-                f"Automated assessment of {self._target} produced {len(findings)} finding(s), "
-                f"{confirmed} confirmed after independent review and evidence audit. "
-                "See the structured findings below; analysis completeness is reported separately."
-            )
+            summary += " 所有调度任务均已完成。"
 
         final_tasks = [
             item.model_copy(update={"status": TaskStatus.DONE}) if item.id == task.id else item
@@ -1250,17 +908,20 @@ class Orchestrator:
         self._event(
             task.run_id,
             "report_written",
-            {"report_dir": str(report_dir), "summary_generated": summary_generated},
+            {
+                "report_dir": str(report_dir),
+                "summary_generated": True,
+                "generator": "deterministic",
+            },
             task_id=task.id,
         )
         return {
             "report_dir": str(report_dir),
-            "summary_generated": summary_generated,
+            "summary_generated": True,
+            "generator": "deterministic",
             "findings": len(findings),
             "evidence": len(evidence),
         }
-
-    # ----------------------------------------------------------------- utils
 
     def _call_agent(self, agent, task: Task, context: dict[str, Any]):
         assert self._budget is not None
