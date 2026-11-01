@@ -304,25 +304,13 @@
         <span class="hint" id="s_keyhint"></span>
       </div>
       <div class="set-row"><label>供应商</label><span style="color:var(--dim)">OpenRouter <span class="hint" id="s_provider"></span></span></div>
-      <div class="set-row"><label>planner 模型</label><input type="text" id="s_m_planner" spellcheck="false"></div>
       <div class="set-row"><label>pentester 模型</label><input type="text" id="s_m_pentester" spellcheck="false"></div>
-      <div class="set-row"><label>reviewer 模型</label><input type="text" id="s_m_reviewer" spellcheck="false"></div>
-      <div class="set-row"><label>reporter 模型</label><input type="text" id="s_m_reporter" spellcheck="false"></div>
-      <div class="set-row"><label>并发任务数</label><input type="text" id="s_par" style="flex:0 0 80px"><span class="hint">max_parallel，模型 key 支持多少并发就开多少</span></div>
+      <div class="set-row"><label>并行执行</label><span style="color:var(--dim)">4 个 Pentester</span><span class="hint">固定四个执行位，共用上方模型配置</span></div>
       <div class="set-row"><label>任务上限</label><input type="text" id="s_tasks" style="flex:0 0 80px"><span class="hint">单轮评估任务数上限</span></div>
       <div style="margin:16px 0 6px; color:var(--faint); font-size:10.5px; letter-spacing:1px">AGENT 提示词（改完保存即热生效；留空恢复默认）</div>
-      <details class="prompt" id="p_planner"><summary>planner（规划）<span class="cust"></span></summary>
-        <div class="pwrap"><textarea spellcheck="false"></textarea>
-          <div class="pbtns"><button class="ghost" onclick="resetPrompt('planner')">恢复默认</button></div></div></details>
       <details class="prompt" id="p_pentester"><summary>pentester（渗透）<span class="cust"></span></summary>
         <div class="pwrap"><textarea spellcheck="false"></textarea>
           <div class="pbtns"><button class="ghost" onclick="resetPrompt('pentester')">恢复默认</button></div></div></details>
-      <details class="prompt" id="p_reviewer"><summary>reviewer（评审）<span class="cust"></span></summary>
-        <div class="pwrap"><textarea spellcheck="false"></textarea>
-          <div class="pbtns"><button class="ghost" onclick="resetPrompt('reviewer')">恢复默认</button></div></div></details>
-      <details class="prompt" id="p_reporter"><summary>reporter（速览）<span class="cust"></span></summary>
-        <div class="pwrap"><textarea spellcheck="false"></textarea>
-          <div class="pbtns"><button class="ghost" onclick="resetPrompt('reporter')">恢复默认</button></div></div></details>
     </div>
     <div class="set-foot">
       <span class="save-ok" id="saveok"></span>
@@ -521,7 +509,7 @@ function renderFlowEvent(e){
     case 'finding_created': flowFinding(p); break;
     case 'finding_status_changed': {
       const el = flowFinds[p.finding_id];
-      if(el) el.querySelector('.fl-sub').textContent = '⎿ 评审结果：' + t(ST, p.status||'');
+      if(el) el.querySelector('.fl-sub').textContent = '⎿ 程序校验结果：' + t(ST, p.status||'');
       break;
     }
     case 'dispatch_parallel':
@@ -665,8 +653,7 @@ async function showBrief(){
 function closeModal(){ $('overlay').classList.remove('show'); window._modalIdx = undefined; }
 
 /* ---------------- 设置面板 ---------------- */
-const ROLES = ['planner','pentester','reviewer','reporter'];
-const ROLE_ZH = {planner:'规划', pentester:'渗透', reviewer:'评审', reporter:'速览'};
+const ROLES = ['pentester'];
 
 function setTheme(t, persist){
   document.documentElement.classList.toggle('dark', t==='dark');
@@ -684,7 +671,7 @@ async function openSettings(){
     $('s_keyhint').textContent = s.key_hint ? ('已配置 '+s.key_hint) : (s.key_set ? '已配置' : '未配置');
     $('s_provider').textContent = '· ' + (s.provider||'');
     ROLES.forEach(r=>{ $('s_m_'+r).value = s.models[r] || ''; });
-    $('s_par').value = s.run.max_parallel; $('s_tasks').value = s.run.max_tasks;
+    $('s_tasks').value = s.run.max_tasks;
     ROLES.forEach(r=>{
       const d = $('p_'+r);
       d.querySelector('textarea').value = s.instructions[r] || '';
@@ -718,8 +705,7 @@ async function saveSettings(){
     const p = $('p_'+r).querySelector('textarea').value;
     body.instructions[r] = p.trim() ? p : '';   // 留空=恢复默认
   });
-  const par = parseInt($('s_par').value, 10), tsk = parseInt($('s_tasks').value, 10);
-  if(par>=1) body.run.max_parallel = par;
+  const tsk = parseInt($('s_tasks').value, 10);
   if(tsk>=1) body.run.max_tasks = tsk;
   if(!ok && !confirm('有角色模型为空，将保留当前值。继续？')) return;
   try{
