@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from uuid import uuid4
 
 from sqlalchemy import func, select
 
@@ -33,7 +35,9 @@ from .models import (
     LLMCallRow,
     MemoryRow,
     MessageRow,
+    ProjectRow,
     ReviewRow,
+    RunProjectRow,
     RunRow,
     TaskRow,
 )
@@ -225,6 +229,7 @@ class TaskRepository:
                     f"task {task.id} version conflict: db={row.version} expected={task.version}"
                 )
             row.status = task.status.value
+            row.objective = task.objective
             row.priority = task.priority
             row.inputs = task.inputs
             row.depends_on = task.depends_on
@@ -664,6 +669,115 @@ class MemoryRepository:
 
 
 @dataclass
+class ProjectRecord:
+    id: str
+    name: str
+    urls: list[str]
+    created_at: datetime
+    updated_at: datetime
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "urls": list(self.urls),
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+def _project_from_row(row: ProjectRow) -> ProjectRecord:
+    return ProjectRecord(
+        id=row.id,
+        name=row.name,
+        urls=[str(u) for u in (row.urls or [])],
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+class ProjectRepository:
+    """Projects group many target URLs under one named engagement."""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def create(self, name: str, urls: list[str]) -> ProjectRecord:
+        now = utcnow()
+        record = ProjectRecord(
+            id=uuid4().hex[:16], name=name, urls=list(urls), created_at=now, updated_at=now
+        )
+        with self.db.session() as session:
+            session.add(
+                ProjectRow(
+                    id=record.id,
+                    name=record.name,
+                    urls=record.urls,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        return record
+
+    def list_all(self) -> list[ProjectRecord]:
+        with self.db.session() as session:
+            rows = session.scalars(
+                select(ProjectRow).order_by(ProjectRow.created_at)
+            ).all()
+            return [_project_from_row(row) for row in rows]
+
+    def get(self, project_id: str) -> ProjectRecord | None:
+        with self.db.session() as session:
+            row = session.get(ProjectRow, project_id)
+            return _project_from_row(row) if row else None
+
+    def update(
+        self, project_id: str, name: str | None = None, urls: list[str] | None = None
+    ) -> ProjectRecord | None:
+        with self.db.session() as session:
+            row = session.get(ProjectRow, project_id)
+            if row is None:
+                return None
+            if name is not None:
+                row.name = name
+            if urls is not None:
+                row.urls = list(urls)
+            row.updated_at = utcnow()
+            session.flush()
+            return _project_from_row(row)
+
+    def delete(self, project_id: str) -> bool:
+        with self.db.session() as session:
+            row = session.get(ProjectRow, project_id)
+            if row is None:
+                return False
+            session.delete(row)
+            for mapping in session.scalars(
+                select(RunProjectRow).where(RunProjectRow.project_id == project_id)
+            ).all():
+                session.delete(mapping)
+        return True
+
+    def attach_run(self, run_id: str, project_id: str) -> None:
+        with self.db.session() as session:
+            existing = session.get(RunProjectRow, run_id)
+            if existing is None:
+                session.add(RunProjectRow(run_id=run_id, project_id=project_id))
+            else:
+                existing.project_id = project_id
+
+    def project_for_run(self, run_id: str) -> str | None:
+        with self.db.session() as session:
+            row = session.get(RunProjectRow, run_id)
+            return row.project_id if row else None
+
+    def run_map(self) -> dict[str, str]:
+        with self.db.session() as session:
+            rows = session.scalars(select(RunProjectRow)).all()
+            return {row.run_id: row.project_id for row in rows}
+
+
+@dataclass
 class Repositories:
     runs: RunRepository
     tasks: TaskRepository
@@ -675,6 +789,7 @@ class Repositories:
     llm_calls: LLMCallRepository
     events: EventRepository
     memories: MemoryRepository
+    projects: ProjectRepository
 
     @classmethod
     def build(cls, db: Database) -> "Repositories":
@@ -689,4 +804,5 @@ class Repositories:
             llm_calls=LLMCallRepository(db),
             events=EventRepository(db),
             memories=MemoryRepository(db),
+            projects=ProjectRepository(db),
         )

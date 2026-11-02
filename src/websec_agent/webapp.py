@@ -18,9 +18,6 @@ from pydantic import BaseModel
 
 from .agents.orchestrator import Orchestrator
 from .agents.pentester import PentesterAgent
-from .agents.planner import PlannerAgent
-from .agents.reporter import ReporterAgent
-from .agents.reviewer import ReviewerAgent
 from .config import load_config, load_scope_policy, load_tools
 from .config_overrides import apply_overrides, load_local, save_local
 from .core.errors import ConfigError, ScopeViolation, WebSecError
@@ -42,8 +39,14 @@ class ChatIn(BaseModel):
 
 
 class RunIn(BaseModel):
-    target: str
+    target: str | None = None
+    project_id: str | None = None
     use_memory: bool = True
+
+
+class ProjectIn(BaseModel):
+    name: str | None = None
+    urls: list[str] | str | None = None
 
 
 class TranslateIn(BaseModel):
@@ -61,11 +64,9 @@ FINDING_TRANSLATE_KEYS = ("title", "description", "impact", "reproduction", "rem
 # Snapshot of factory prompt defaults, taken at import time (before overrides are
 # applied) so the settings panel can always show and restore originals.
 _AGENT_CLASSES = {
-    Role.PLANNER: PlannerAgent,
     Role.PENTESTER: PentesterAgent,
-    Role.REVIEWER: ReviewerAgent,
-    Role.REPORTER: ReporterAgent,
 }
+_MODEL_ROLES = (Role.PENTESTER, Role.SUPERVISOR)
 DEFAULT_INSTRUCTIONS = {role.value: cls.instructions for role, cls in _AGENT_CLASSES.items()}
 
 
@@ -130,6 +131,73 @@ class Console:
         self._translate_lock = threading.Lock()
         self.state = RunState()
         self._chat_lock = threading.Lock()
+
+    # --------------------------------------------------------------- projects
+    @staticmethod
+    def _clean_urls(urls: list[str] | str | None) -> list[str]:
+        if urls is None:
+            return []
+        raw = urls.splitlines() if isinstance(urls, str) else list(urls)
+        cleaned: list[str] = []
+        for item in raw:
+            url = str(item).strip()
+            if not url:
+                continue
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            if url not in cleaned:
+                cleaned.append(url)
+        return cleaned
+
+    def active_project_id(self) -> str | None:
+        value = load_local().get("active_project_id")
+        if not isinstance(value, str) or not value:
+            return None
+        db, repos = self.db_view()
+        return value if repos.projects.get(value) is not None else None
+
+    def set_active_project(self, project_id: str | None) -> None:
+        local = load_local()
+        if project_id:
+            local["active_project_id"] = project_id
+        else:
+            local.pop("active_project_id", None)
+        save_local(local)
+
+    def projects_view(self) -> dict[str, Any]:
+        db, repos = self.db_view()
+        projects = repos.projects.list_all()
+        active = self.active_project_id()
+        run_map = repos.projects.run_map()
+        counts = {p.id: 0 for p in projects}
+        for project_id in run_map.values():
+            if project_id in counts:
+                counts[project_id] += 1
+        return {
+            "active_project_id": active,
+            "projects": [
+                {**p.to_dict(), "run_count": counts.get(p.id, 0), "active": p.id == active}
+                for p in projects
+            ],
+        }
+
+    def _resolve_project(
+        self, project_id: str | None, target: str
+    ) -> tuple[str | None, list[str]]:
+        """Return (project_id, project_urls); infer the active project when the
+        target belongs to it so chat-launched runs land in the right project."""
+        db, repos = self.db_view()
+        if project_id:
+            project = repos.projects.get(project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="project not found")
+            return project.id, project.urls
+        active = self.active_project_id()
+        if active:
+            project = repos.projects.get(active)
+            if project is not None and target in project.urls:
+                return project.id, project.urls
+        return None, []
 
     # ------------------------------------------------------------ translations
     def _load_translations(self) -> dict[str, Any]:
@@ -373,13 +441,26 @@ class Console:
             self._save_translations()
         return {"cached": False, "items": items}
 
-    def start_run(self, target: str, use_memory: bool) -> dict[str, Any]:
+    def start_run(
+        self, target: str | None, use_memory: bool, project_id: str | None = None
+    ) -> dict[str, Any]:
+        project_id, project_urls = self._resolve_project(project_id, target or "")
+        if not target:
+            if project_urls:
+                target = project_urls[0]
+            else:
+                raise HTTPException(
+                    status_code=400, detail="target URL required (or pass project_id)"
+                )
+        if not target.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="target must be an http(s) URL")
+
         guard = ScopeGuard(self.policy, target)
         if self.allow_hosts:
             guard.expand(self.allow_hosts)
 
         registry = ModelRegistry(self.config)
-        for role in (Role.PLANNER, Role.PENTESTER, Role.REVIEWER, Role.REPORTER):
+        for role in _MODEL_ROLES:
             registry.resolve(role)
 
         db = Database(self.db_url)
@@ -428,7 +509,14 @@ class Console:
             raise HTTPException(status_code=500, detail="run failed to initialize")
         with self.state.lock:
             self.state.active_run_id = run_id
-        return {"run_id": run_id, "target": target, "use_memory": use_memory}
+        if project_id:
+            repos.projects.attach_run(run_id, project_id)
+        return {
+            "run_id": run_id,
+            "target": target,
+            "use_memory": use_memory,
+            "project_id": project_id,
+        }
 
     def _await_new_run_row(
         self, db: Database, known_ids: set[str], timeout: float
@@ -449,7 +537,65 @@ class Console:
         return db, Repositories.build(db)
 
     # -------------------------------------------------------------------- chat
-    LAUNCH_RE = re.compile(r"^\[LAUNCH\s+(https?://[^\s\]]+)\]", re.IGNORECASE)
+    CHAT_ACTION_RE = re.compile(
+        r"\[(LAUNCH|PROJECT|ADDURL)\s+([^\]\n]*)\]", re.IGNORECASE
+    )
+
+    def _chat_actions(self, reply: str) -> tuple[str, list[str], dict[str, Any]]:
+        """Execute chat markers so the assistant can manage projects and launch
+        runs without the operator filling any form."""
+        notes: list[str] = []
+        extra: dict[str, Any] = {}
+        repos = Repositories.build(Database(self.db_url))
+        for match in list(self.CHAT_ACTION_RE.finditer(reply)):
+            kind = match.group(1).upper()
+            payload = match.group(2).strip()
+            if kind == "PROJECT":
+                name, _, urls_part = payload.partition("|")
+                name = name.strip() or "未命名项目"
+                urls = self._clean_urls(urls_part)
+                project = repos.projects.create(name, urls)
+                self.set_active_project(project.id)
+                notes.append(
+                    f"⏺ 已创建项目「{name}」（{len(urls)} 个 URL）并设为当前项目。"
+                )
+            elif kind == "ADDURL":
+                active = self.active_project_id()
+                if not active:
+                    notes.append("⏺ 追加 URL 失败：当前没有选中项目。")
+                    continue
+                current = repos.projects.get(active)
+                if current is None:
+                    notes.append("⏺ 追加 URL 失败：项目不存在。")
+                    continue
+                added = self._clean_urls(payload)
+                merged = list(dict.fromkeys([*current.urls, *added]))
+                repos.projects.update(active, urls=merged)
+                notes.append(
+                    f"⏺ 已向项目「{current.name}」追加 {len(added)} 个 URL，现共 {len(merged)} 个。"
+                )
+            elif kind == "LAUNCH":
+                if self.state.active_run_id:
+                    notes.append("⏺ 已有评估在运行，本次未启动新评估。")
+                    continue
+                target = payload.split()[0].rstrip(".,;、。") if payload else ""
+                if not target.startswith(("http://", "https://")):
+                    notes.append("⏺ 发起失败：需要一个完整的 http(s) URL。")
+                    continue
+                try:
+                    result = self.start_run(target, use_memory=True)
+                    extra = {"run_id": result["run_id"], "target": target}
+                    notes.append(
+                        f"⏺ 评估已启动（run {result['run_id'][:8]}），"
+                        "中栏实时展示执行流程。Agent 全程执行无害只读验证。"
+                    )
+                except HTTPException as exc:
+                    notes.append(f"⏺ 发起失败：{exc.detail}")
+            else:  # pragma: no cover - regex only matches the three kinds
+                continue
+            extra.setdefault("actions", []).append(kind.lower())
+        reply = self.CHAT_ACTION_RE.sub("", reply).strip()
+        return reply, notes, extra
 
     def chat(self, payload: ChatIn) -> dict[str, Any]:
         history = payload.history[-MAX_CHAT_HISTORY:]
@@ -464,16 +610,29 @@ class Console:
             "steps. Be concrete and reference findings/evidence by id when "
             "useful. Reply in the operator's language (Chinese by default).\n\n"
             "LAUNCHING ASSESSMENTS: the operator starts a run by chatting. When "
-            "the operator's message names a clear target URL and asks you to "
-            "start testing (评估/测试/渗透/打一下), AND state.active_run_id is "
-            "null, begin your reply with the marker [LAUNCH <url>] followed by "
-            "a one-line Chinese confirmation (mention harmless read-only "
-            "doctrine). The harness starts the run and shows it live. Do NOT "
-            "output the marker when: a run is already active (active_run_id is "
-            "set — tell the operator to wait), no clear absolute URL was given "
-            "(ask for one), or the operator only asked a question. Never "
-            "fabricate the marker for hosts other than what the operator "
-            "named.\n\n"
+            "the operator names a clear target URL and asks you to start testing "
+            "(评估/测试/渗透/打一下), AND state.active_run_id is null, output the "
+            "marker [LAUNCH <url>] on its own line, followed by a one-line "
+            "Chinese confirmation. The harness starts the run, shows it live, "
+            "and writes a local report when it finishes. Do NOT output the "
+            "marker when a run is already active, when you would have to invent "
+            "the URL, or when the operator only asked a question.\n\n"
+            "PROJECTS: every assessment belongs to a project. The operator may "
+            "skip forms entirely and just say e.g. 挖公益SRC漏洞 - no URL at "
+            "all. In that case:\n"
+            "1. create a project first with [PROJECT 项目名 | url1 url2] (the "
+            "part after | is optional - a project may start with zero URLs);\n"
+            "2. when the operator tells you where to look (SRC platform, domain "
+            "list, keyword) add every concrete URL to the active project with "
+            "[ADDURL url1 url2] - never invent or guess hosts, only use URLs "
+            "the operator supplied or that are present in the console state;\n"
+            "3. ask exactly one short question if you still need a concrete "
+            "URL, then launch with [LAUNCH <url>] once you have one.\n"
+            "Each URL of a project is tested in its own run. Scope is "
+            "unrestricted: redirects and other hosts are allowed.\n\n"
+            "REPORT: when a run finishes, the harness writes a local report - "
+            "summarise findings and remind the operator it is stored under "
+            "artifacts and viewable from the console.\n\n"
             "Current console state (JSON):\n" + context
         )
         settings, gateway = ModelRegistry(self.config).resolve(Role.PENTESTER)
@@ -497,20 +656,9 @@ class Console:
 
         reply = response.text.strip()
         extra: dict[str, Any] = {}
-        match = self.LAUNCH_RE.match(reply)
-        if match:
-            target = match.group(1).rstrip(".,;、。")
-            reply = reply[match.end() :].strip()
-            try:
-                result = self.start_run(target, use_memory=True)
-                extra = {"run_id": result["run_id"], "target": target}
-                reply += (
-                    f"\n\n⏺ 评估已启动（run {result['run_id'][:8]}），"
-                    "中栏实时展示执行流程。Agent 全程执行无害只读验证。"
-                )
-            except HTTPException as exc:
-                detail = str(exc.detail)
-                reply += f"\n\n⏺ 发起失败：{detail}"
+        reply, notes, extra = self._chat_actions(reply)
+        if notes:
+            reply = (reply + "\n\n" + "\n".join(notes)).strip()
         return {"reply": reply, "model": response.model, **extra}
 
     def _chat_context(self) -> str:
@@ -518,9 +666,22 @@ class Console:
 
         state: dict[str, Any] = {
             "active_run": self.state.active_run_id,
+            "unrestricted_scope": bool(self.policy.unrestricted),
             "scope_allowed_hosts": sorted(self.policy.allowed_hosts or []),
             "tools": sorted(self.tools.tools),
         }
+        try:
+            projects = self.projects_view()
+            active_id = projects.get("active_project_id")
+            state["active_project"] = next(
+                (p for p in projects["projects"] if p["id"] == active_id), None
+            )
+            state["projects"] = [
+                {"name": p["name"], "urls": p["urls"], "runs": p["run_count"]}
+                for p in projects["projects"]
+            ]
+        except Exception as exc:  # noqa: BLE001 - context is best-effort
+            state["projects_error"] = str(exc)
         knowledge = self.knowledge.entries_for_all()
         if knowledge:
             state["cross_run_knowledge"] = [
@@ -569,7 +730,7 @@ def create_app(console: Console) -> FastAPI:
     @app.post("/api/runs")
     def launch_run(body: RunIn) -> JSONResponse:
         try:
-            result = console.start_run(body.target, body.use_memory)
+            result = console.start_run(body.target, body.use_memory, body.project_id)
         except ScopeViolation as exc:
             raise HTTPException(status_code=400, detail=f"scope violation: {exc}") from exc
         except ConfigError as exc:
@@ -581,15 +742,69 @@ def create_app(console: Console) -> FastAPI:
         return {
             "active_run_id": console.state.active_run_id,
             "last_error": console.state.error,
+            "unrestricted": bool(console.policy.unrestricted),
             "allowed_hosts": sorted(console.policy.allowed_hosts or []),
             "allow_private": bool(console.policy.allow_private),
             "tools": sorted(console.tools.tools),
+            **console.projects_view(),
         }
 
+    # --------------------------------------------------------------- projects
+    @app.get("/api/projects")
+    def list_projects() -> dict[str, Any]:
+        return console.projects_view()
+
+    @app.post("/api/projects")
+    def create_project(body: ProjectIn) -> dict[str, Any]:
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="项目名称不能为空")
+        urls = console._clean_urls(body.urls)
+        db, repos = console.db_view()
+        project = repos.projects.create(name, urls)
+        if not console.active_project_id():
+            console.set_active_project(project.id)
+        return {"project": project.to_dict()}
+
+    @app.put("/api/projects/{project_id}")
+    def update_project(project_id: str, body: ProjectIn) -> dict[str, Any]:
+        db, repos = console.db_view()
+        urls = console._clean_urls(body.urls) if body.urls is not None else None
+        name = body.name.strip() if isinstance(body.name, str) and body.name.strip() else None
+        project = repos.projects.update(project_id, name=name, urls=urls)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return {"project": project.to_dict()}
+
+    @app.delete("/api/projects/{project_id}")
+    def delete_project(project_id: str) -> dict[str, Any]:
+        db, repos = console.db_view()
+        if not repos.projects.delete(project_id):
+            raise HTTPException(status_code=404, detail="project not found")
+        if console.active_project_id() is None:
+            console.set_active_project(None)
+        return {"ok": True}
+
+    @app.post("/api/projects/{project_id}/activate")
+    def activate_project(project_id: str) -> dict[str, Any]:
+        db, repos = console.db_view()
+        if repos.projects.get(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        console.set_active_project(project_id)
+        return console.projects_view()
+
+    @app.post("/api/projects/deactivate")
+    def deactivate_project() -> dict[str, Any]:
+        console.set_active_project(None)
+        return console.projects_view()
+
     @app.get("/api/runs")
-    def list_runs() -> dict[str, Any]:
+    def list_runs(project_id: str | None = None) -> dict[str, Any]:
         db, repos = console.db_view()
         runs = repos.runs.list_all()
+        run_map = repos.projects.run_map()
+        if project_id:
+            runs = [r for r in runs if run_map.get(r.id) == project_id]
         return {
             "runs": [
                 {
@@ -598,6 +813,7 @@ def create_app(console: Console) -> FastAPI:
                     "status": r.status.value,
                     "started_at": r.started_at.isoformat(),
                     "stats": r.stats,
+                    "project_id": run_map.get(r.id),
                 }
                 for r in reversed(runs)
             ]
@@ -631,6 +847,7 @@ def create_app(console: Console) -> FastAPI:
                     "status": t.status.value,
                     "objective": t.objective,
                     "priority": t.priority,
+                    "agent": t.inputs.get("pentester_label"),
                 }
                 for t in tasks
             ],
@@ -716,7 +933,7 @@ def create_app(console: Console) -> FastAPI:
             "key_set": bool(key),
             "models": {
                 role.value: console.config.roles[role].model
-                for role in _AGENT_CLASSES
+                for role in _MODEL_ROLES
             },
             "instructions": {
                 role.value: (instructions.get(role.value) or DEFAULT_INSTRUCTIONS[role.value])
@@ -728,7 +945,7 @@ def create_app(console: Console) -> FastAPI:
                 for role in _AGENT_CLASSES
             },
             "run": {
-                "max_parallel": console.config.run.max_parallel,
+                "max_parallel": 4,
                 "max_tasks": console.config.run.max_tasks,
             },
             "theme": local.get("theme") or "light",
@@ -742,7 +959,7 @@ def create_app(console: Console) -> FastAPI:
         if isinstance(payload.get("models"), dict):
             merged = local.get("models") or {}
             for role_value, model in payload["models"].items():
-                if role_value in {role.value for role in _AGENT_CLASSES} and isinstance(model, str):
+                if role_value in {role.value for role in _MODEL_ROLES} and isinstance(model, str):
                     merged[role_value] = model.strip()
             local["models"] = merged
         if isinstance(payload.get("instructions"), dict):
@@ -757,7 +974,7 @@ def create_app(console: Console) -> FastAPI:
             local["instructions"] = merged
         if isinstance(payload.get("run"), dict):
             merged = local.get("run") or {}
-            for name in ("max_parallel", "max_tasks"):
+            for name in ("max_tasks",):
                 value = payload["run"].get(name)
                 if isinstance(value, int) and value >= 1:
                     merged[name] = value

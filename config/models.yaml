@@ -2,8 +2,9 @@
 #
 # 设计原则：
 #   - 本文件不绑定任何具体模型名 / 供应商 SDK，全部通过 OpenAI-compatible HTTP 接口接入。
-#   - 启动时若任一必需角色的 model 为空，直接报错退出，避免静默使用错误模型。
-#   - auditor 为程序化证据审计（哈希 / 范围 / 字段完整性），不消耗模型，因此不在 roles 中。
+#   - 四个 Pentester 并行任务共用同一个 pentester 模型配置。
+#   - Supervisor 使用独立模型路由，只负责分工、去重协调与阶段性指导。
+#   - 审计与报告由程序执行，不配置独立模型角色。
 #   - 成本为 0 表示不参与预算统计；run 预算为 0 表示不限制。
 
 # 生产使用 docker-compose 提供的 PostgreSQL；pytest 通过 Repository 注入 SQLite。
@@ -16,20 +17,9 @@ run:
   max_total_tokens: 0
   max_tasks: 120
   max_replans: 8
-  max_parallel: 2
+  max_parallel: 4
 
 roles:
-  planner:
-    provider: openai_compatible
-    model: "nvidia/nemotron-3.5-super-vl:free"
-    base_url: "https://openrouter.ai/api/v1"
-    api_key_env: "WEBSEC_OPENROUTER_KEY"
-    temperature: 0.1
-    max_output_tokens: 16384
-    context_window_tokens: 1000000
-    input_cost_per_mtok: 0
-    output_cost_per_mtok: 0
-
   pentester:
     provider: openai_compatible
     model: "nvidia/nemotron-3.5-super-vl:free"
@@ -41,24 +31,13 @@ roles:
     input_cost_per_mtok: 0
     output_cost_per_mtok: 0
 
-  reviewer:
+  supervisor:
     provider: openai_compatible
     model: "nvidia/nemotron-3.5-super-vl:free"
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "WEBSEC_OPENROUTER_KEY"
-    temperature: 0.0
-    max_output_tokens: 4096
-    context_window_tokens: 1000000
-    input_cost_per_mtok: 0
-    output_cost_per_mtok: 0
-
-  reporter:
-    provider: openai_compatible
-    model: "nvidia/nemotron-3.5-super-vl:free"
-    base_url: "https://openrouter.ai/api/v1"
-    api_key_env: "WEBSEC_OPENROUTER_KEY"
-    temperature: 0.2
-    max_output_tokens: 4096
+    temperature: 0.1
+    max_output_tokens: 2048
     context_window_tokens: 1000000
     input_cost_per_mtok: 0
     output_cost_per_mtok: 0

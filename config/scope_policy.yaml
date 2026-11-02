@@ -1,16 +1,19 @@
-# 授权范围。run 的目标 host 始终被视为已授权；这里用于显式扩容与收紧。
+# 作用域策略：无限制模式。
 #
-# allowed_hosts 支持精确 host 与 *.suffix 通配（通配只匹配子域，不含 apex）。
-# 所有实际发包在工具执行层经过 ScopeGuard，不依赖 prompt 自觉。
-# 发现范围外资产时不会自动扩容，任务会失败并记录 scope_violation 事件，需用户追加授权。
+# unrestricted: true —— 取消 host 白名单、端口白名单与私网/回环拦截。
+#   * 302 跳转到其他 host / 端口不再触发 scope_violation，任务不会中断；
+#   * 目标归属由「项目」管理（一个项目可以挂多个 URL），不再依赖 URL 白名单；
+#   * 仅 http/https 协议仍然被要求（非 HTTP 工具参数不做拦截）。
+#
+# 如需切回白名单模式：把 unrestricted 设为 false，并填充 allowed_hosts。
+unrestricted: true
 
-allowed_hosts:
-  - "demo.testfire.net"
+allowed_hosts: []
 
 denied_hosts: []
 
-# 允许访问私网 / 回环地址（本地测试时才开启）。
-allow_private: false
+# 无限制模式下该字段不再生效（保留以便切回白名单模式）。
+allow_private: true
 
-# 允许的端口；空列表表示任意端口。
+# 空列表表示任意端口。
 allowed_ports: []

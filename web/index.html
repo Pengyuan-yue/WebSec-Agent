@@ -245,7 +245,11 @@
     <span>已确认 <b id="h_finds">0</b></span>
     <span>工具 <b id="h_tools">0</b></span>
   </div>
+  <select id="projsel" onchange="switchProject(this.value)" title="切换项目"></select>
+  <button class="ghost" id="projbtn" onclick="openProject()" title="新建 / 编辑项目">＋项目</button>
   <select id="runsel" onchange="selectRun(this.value)" title="切换历史评估"></select>
+  <button class="ghost" id="launchbtn" onclick="openLaunch()" title="对当前项目发起评估">▶ 评估</button>
+  <button class="ghost" id="repbtn" onclick="showReport()" title="查看当前评估的本地报告">报告</button>
   <button id="setbtn" title="设置" onclick="openSettings()">⚙</button>
   <div class="pill" id="statuspill"><span class="pfx">⏺</span> 空闲</div>
 </header>
@@ -304,25 +308,14 @@
         <span class="hint" id="s_keyhint"></span>
       </div>
       <div class="set-row"><label>供应商</label><span style="color:var(--dim)">OpenRouter <span class="hint" id="s_provider"></span></span></div>
-      <div class="set-row"><label>planner 模型</label><input type="text" id="s_m_planner" spellcheck="false"></div>
       <div class="set-row"><label>pentester 模型</label><input type="text" id="s_m_pentester" spellcheck="false"></div>
-      <div class="set-row"><label>reviewer 模型</label><input type="text" id="s_m_reviewer" spellcheck="false"></div>
-      <div class="set-row"><label>reporter 模型</label><input type="text" id="s_m_reporter" spellcheck="false"></div>
-      <div class="set-row"><label>并发任务数</label><input type="text" id="s_par" style="flex:0 0 80px"><span class="hint">max_parallel，模型 key 支持多少并发就开多少</span></div>
+      <div class="set-row"><label>supervisor 模型</label><input type="text" id="s_m_supervisor" spellcheck="false"></div>
+      <div class="set-row"><label>并行执行</label><span style="color:var(--dim)">4 个 Pentester</span><span class="hint">固定四个执行位，共用上方模型配置</span></div>
       <div class="set-row"><label>任务上限</label><input type="text" id="s_tasks" style="flex:0 0 80px"><span class="hint">单轮评估任务数上限</span></div>
       <div style="margin:16px 0 6px; color:var(--faint); font-size:10.5px; letter-spacing:1px">AGENT 提示词（改完保存即热生效；留空恢复默认）</div>
-      <details class="prompt" id="p_planner"><summary>planner（规划）<span class="cust"></span></summary>
-        <div class="pwrap"><textarea spellcheck="false"></textarea>
-          <div class="pbtns"><button class="ghost" onclick="resetPrompt('planner')">恢复默认</button></div></div></details>
       <details class="prompt" id="p_pentester"><summary>pentester（渗透）<span class="cust"></span></summary>
         <div class="pwrap"><textarea spellcheck="false"></textarea>
           <div class="pbtns"><button class="ghost" onclick="resetPrompt('pentester')">恢复默认</button></div></div></details>
-      <details class="prompt" id="p_reviewer"><summary>reviewer（评审）<span class="cust"></span></summary>
-        <div class="pwrap"><textarea spellcheck="false"></textarea>
-          <div class="pbtns"><button class="ghost" onclick="resetPrompt('reviewer')">恢复默认</button></div></div></details>
-      <details class="prompt" id="p_reporter"><summary>reporter（速览）<span class="cust"></span></summary>
-        <div class="pwrap"><textarea spellcheck="false"></textarea>
-          <div class="pbtns"><button class="ghost" onclick="resetPrompt('reporter')">恢复默认</button></div></div></details>
     </div>
     <div class="set-foot">
       <span class="save-ok" id="saveok"></span>
@@ -336,7 +329,7 @@
 let selectedRun = null, evCount = 0, chatHistory = [], busy = false;
 
 /* ---------- 中文映射 ---------- */
-const KIND = {recon:'侦察', plan:'规划', analyze:'分析', exploit:'利用', validate:'验证', review:'评审', audit:'审计', report:'报告'};
+const KIND = {recon:'侦察', plan:'规划', supervise:'协调', analyze:'分析', exploit:'利用', validate:'验证', review:'评审', audit:'审计', report:'报告'};
 const ST = {completed:'已完成', completed_with_errors:'完成·含错', running:'进行中', failed:'失败',
             pending:'等待中', ready:'就绪', done:'完成', skipped:'已跳过', proposed:'已提出',
             confirmed:'已确认', uncertain:'不确定', rejected:'已驳回', needs_evidence:'需补证据'};
@@ -347,7 +340,10 @@ const EVT = {run_started:'开始运行', run_finished:'运行结束', task_creat
              finding_status_changed:'发现状态更新', oast_started:'OAST 通道启动', oast_stopped:'OAST 通道关闭',
              oast_interaction:'OAST 回调', plan_cycle_created:'迭代规划', plan_empty:'计划为空',
              replan_created:'重规划', replan_limit_reached:'重规划上限', report_written:'报告已生成',
-             tool_requests_deduplicated:'工具请求去重', tool_requests_truncated:'工具请求截断'};
+             tool_requests_deduplicated:'工具请求去重', tool_requests_truncated:'工具请求截断',
+             supervisor_completed:'Supervisor 已调整分工', supervisor_failed:'Supervisor 异常·使用默认分工',
+             supervisor_unavailable:'Supervisor 不可用·使用默认分工', supervisor_assignment_applied:'已更新执行位指导',
+             supervisor_budget_exhausted:'Supervisor 调用预算用尽'};
 const t = (map, v) => map[v] || v;
 
 const $ = id => document.getElementById(id);
@@ -387,13 +383,14 @@ async function sendChat(){
     $('chatmodel').textContent = out.model || '';
     chatHistory.push({role:'user', content: msg}, {role:'assistant', content: out.reply});
     if(chatHistory.length > 16) chatHistory = chatHistory.slice(-16);
+    if(out.actions || !out.run_id){ await refreshProjects(); }
     if(out.run_id){           // 对话发起的评估 → 切过去实时跟踪
       selectedRun = out.run_id; evCount = 0;
       for(const k in flowTasks) delete flowTasks[k];
       for(const k in flowFinds) delete flowFinds[k];
       setPill('run', '评估中');
       startPolling(); refreshRuns();
-    }
+    } else if(out.actions && out.actions.length){ refreshRuns(); }
   }catch(e){ think.remove(); addMsg('ai', '调用失败: '+e.message); }
   busy = false; $('sendbtn').disabled = false;
 }
@@ -425,9 +422,142 @@ function setPill(cls, text){
 
 function hostOf(u){ try{ return new URL(u).hostname; }catch(e){ return u; } }
 
+/* ---------------- 项目：一个项目可挂多个 URL ---------------- */
+let activeProject = null;
+
+async function refreshProjects(){
+  try{
+    const d = await api('/api/projects');
+    window._projects = d.projects || [];
+    activeProject = (d.projects||[]).find(p=>p.id===d.active_project_id) || null;
+    const sel = $('projsel');
+    sel.innerHTML = '<option value="">— 全部项目 —</option>' + (d.projects||[]).map(p=>
+      `<option value="${esc(p.id)}">${esc(p.name)} · ${p.urls.length} URL · ${p.run_count||0} 次评估</option>`).join('');
+    sel.value = activeProject ? activeProject.id : '';
+    $('launchbtn').style.display = activeProject ? '' : 'none';
+    $('projbtn').textContent = activeProject ? '✎ 项目' : '＋项目';
+  }catch(e){ console.error(e); }
+}
+
+async function switchProject(id){
+  try{
+    await api(id ? '/api/projects/'+id+'/activate' : '/api/projects/deactivate', {method:'POST'});
+    await refreshProjects();
+    selectedRun = null; evCount = 0;
+    $('events').innerHTML = '<div class="empty">— 选择一个评估，或发起新评估 —</div>';
+    $('findings').innerHTML = '<div class="empty">— 暂无发现 —</div>';
+    await refreshRuns();
+  }catch(e){ alert('切换项目失败: '+e.message); }
+}
+
+let editingProject = false;
+function openProject(){
+  const p = activeProject;
+  editingProject = !!p;
+  $('modal-title').textContent = p ? '编辑项目 · ' + p.name : '新建项目';
+  $('modal-body').innerHTML = `
+    <div class="sec"><h4>项目名称</h4>
+      <input id="pj_name" type="text" spellcheck="false" style="width:100%;background:var(--panel);border:1px solid var(--line2);color:var(--text);padding:7px 9px;border-radius:4px"></div>
+    <div class="sec"><h4>目标 URL · 每行一个，可填多个（可留空，之后在对话里补充）</h4>
+      <textarea id="pj_urls" rows="8" spellcheck="false" placeholder="https://target.example.com/\nhttps://target.example.com/app\nhttps://api.target.example.com/" style="width:100%;background:var(--panel);border:1px solid var(--line2);color:var(--text);padding:8px 10px;font:11px/1.55 ui-monospace,monospace;border-radius:4px;resize:vertical"></textarea></div>
+    <div id="pj_msg" style="color:var(--dim);font-size:11px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:4px">
+      <button class="primary" onclick="saveProject()">保存</button>
+      ${p?`<button class="ghost" onclick="deleteProject()">删除项目</button>`:''}
+      <button class="ghost" onclick="closeModal()">取消</button>
+    </div>`;
+  $('pj_name').value = p ? p.name : '';
+  $('pj_urls').value = p ? p.urls.join('\n') : '';
+  $('overlay').classList.add('show');
+}
+
+async function saveProject(){
+  const name = $('pj_name').value.trim();
+  const urls = $('pj_urls').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  if(!name){ $('pj_msg').textContent = '项目名称不能为空'; return; }
+  try{
+    const out = await api(editingProject ? '/api/projects/'+activeProject.id : '/api/projects',
+      {method: editingProject ? 'PUT' : 'POST', headers:{'Content-Type':'application/json'},
+       body: JSON.stringify({name, urls})});
+    const pid = editingProject ? activeProject.id : out.project.id;
+    await api('/api/projects/'+pid+'/activate', {method:'POST'});
+    closeModal(); await refreshProjects(); await refreshRuns();
+  }catch(e){ $('pj_msg').textContent = '保存失败: '+e.message; }
+}
+
+async function deleteProject(){
+  if(!editingProject) return;
+  if(!confirm('删除项目「'+activeProject.name+'」？已产生的评估记录会保留。')) return;
+  try{
+    await api('/api/projects/'+activeProject.id, {method:'DELETE'});
+    closeModal(); activeProject = null; await refreshProjects(); await refreshRuns();
+  }catch(e){ $('pj_msg').textContent = '删除失败: '+e.message; }
+}
+
+function openLaunch(){
+  if(!activeProject){
+    $('modal-title').textContent = '发起评估';
+    $('modal-body').innerHTML = '<div class="empty">先点「＋项目」创建项目，也可以在右侧对话里直接说「挖公益SRC漏洞」，由 AI 自己建项目。<br>项目可以一个 URL 都不填。</div>';
+    $('overlay').classList.add('show');
+    return;
+  }
+  const list = activeProject.urls.length
+    ? activeProject.urls.map(u=>`<div class="sec" style="display:flex;align-items:center;gap:10px">
+        <code style="flex:1;word-break:break-all">${esc(u)}</code>
+        <button class="primary" onclick="launchUrl('${esc(u).replace(/'/g,'&#39;')}')">评估</button></div>`).join('')
+    : '<div class="empty">这个项目还没有 URL。可以在下方直接填入并评估，或在对话里告诉 AI 去哪找目标。</div>';
+  $('modal-title').textContent = '发起评估 · ' + activeProject.name;
+  $('modal-body').innerHTML = `
+    <div style="color:var(--dim);font-size:11px;margin-bottom:8px">选择本项目中的一个 URL 作为本次评估入口（作用域无限制，跳转与关联主机均放行）</div>
+    ${list}
+    <div class="sec"><h4>追加 URL 并评估</h4>
+      <div style="display:flex;gap:8px">
+        <input id="newurl" type="text" spellcheck="false" placeholder="https://example.com/" style="flex:1;background:var(--panel);border:1px solid var(--line2);color:var(--text);padding:7px 9px;border-radius:4px">
+        <button class="primary" onclick="addAndLaunch()">加入并评估</button>
+      </div></div>`;
+  $('overlay').classList.add('show');
+}
+
+async function addAndLaunch(){
+  const url = $('newurl').value.trim();
+  if(!url){ alert('请填写 URL'); return; }
+  try{
+    await api('/api/projects/'+activeProject.id, {method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({urls:[...(activeProject.urls||[]), url]})});
+    await refreshProjects();
+    await launchUrl(activeProject.urls.includes(url) ? url : (url.startsWith('http') ? url : 'https://'+url));
+  }catch(e){ alert('添加失败: '+e.message); }
+}
+
+async function launchUrl(url){
+  closeModal();
+  $('events').innerHTML = '<div class="empty">启动中…</div>';
+  try{
+    const out = await api('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({target:url, project_id:activeProject.id})});
+    selectedRun = out.run_id; evCount = 0;
+    for(const k in flowTasks) delete flowTasks[k];
+    for(const k in flowFinds) delete flowFinds[k];
+    setPill('run','评估中'); startPolling(); await refreshProjects(); await refreshRuns(); pollEvents(true);
+  }catch(e){ $('events').innerHTML = '<div class="empty">启动失败: '+esc(e.message)+'</div>'; }
+}
+
+async function showReport(){
+  if(!selectedRun){ $('modal-title').textContent = '评估报告'; $('modal-body').innerHTML = '<div class="empty">先选择一个评估。</div>'; $('overlay').classList.add('show'); return; }
+  $('modal-title').textContent = '评估报告 · run ' + selectedRun.slice(0,8);
+  $('modal-body').innerHTML = '<div class="empty">读取中…</div>';
+  $('overlay').classList.add('show');
+  try{
+    const d = await api('/api/runs/'+selectedRun+'/report');
+    $('modal-body').innerHTML = `<div style="color:var(--dim);font-size:11px;margin-bottom:8px">本地文件：artifacts/…/report.md</div>
+      <div class="md" style="max-height:62vh;overflow:auto">${mdlite(d.markdown||'')}</div>`;
+  }catch(e){ $('modal-body').innerHTML = '<div class="empty">该评估暂无报告（评估未结束或未生成）：'+esc(e.message)+'</div>'; }
+}
+
 async function refreshRuns(){
   try{
-    const data = await api('/api/runs');
+    const q = activeProject ? '/api/runs?project_id='+encodeURIComponent(activeProject.id) : '/api/runs';
+    const data = await api(q);
     window._runs = data.runs;
     const sel = $('runsel');
     const groups = new Map();                    // 项目（目标）分组
@@ -477,7 +607,7 @@ function flowTask(tid){
   const el = document.createElement('div');
   el.className = 'fl';
   const st = info.status==='done' ? 'done' : (info.status==='failed' ? 'fail' : 'run');
-  el.innerHTML = `<span class="fl-b">⏺</span><span class="fl-k">${t(KIND, info.kind||'')}</span><span class="fl-o">${esc((info.objective||'').slice(0,64))}</span><span class="fl-st ${st}">${st==='done'?'✓':(st==='fail'?'✗':'✻')}</span><span class="fl-ev"></span><div class="fl-err"></div>`;
+  el.innerHTML = `<span class="fl-b">⏺</span><span class="fl-k">${t(KIND, info.kind||'')}</span>${info.agent ? `<span class="fl-k">${esc(info.agent)}</span>` : ''}<span class="fl-o">${esc((info.objective||'').slice(0,64))}</span><span class="fl-st ${st}">${st==='done'?'✓':(st==='fail'?'✗':'✻')}</span><span class="fl-ev"></span><div class="fl-err"></div>`;
   $('events').appendChild(el);
   const stEl = el.querySelector('.fl-st'), evEl = el.querySelector('.fl-ev'), errEl = el.querySelector('.fl-err');
   const handler = {
@@ -521,11 +651,11 @@ function renderFlowEvent(e){
     case 'finding_created': flowFinding(p); break;
     case 'finding_status_changed': {
       const el = flowFinds[p.finding_id];
-      if(el) el.querySelector('.fl-sub').textContent = '⎿ 评审结果：' + t(ST, p.status||'');
+      if(el) el.querySelector('.fl-sub').textContent = '⎿ 程序校验结果：' + t(ST, p.status||'');
       break;
     }
     case 'dispatch_parallel':
-      flowNote(`并行执行 <b>${(p.kinds||[]).length}</b> 个任务（${(p.kinds||[]).map(k=>t(KIND,k)).join('、')}）`, 'parallel'); break;
+      flowNote(`并行执行 <b>${(p.agents||[]).length || (p.kinds||[]).length}</b> 个 Pentester 任务（${(p.agents||[]).map(esc).join('、') || (p.kinds||[]).map(k=>t(KIND,k)).join('、')}）`, 'parallel'); break;
     case 'plan_cycle_created':
       flowNote(`证据持续增长，启动第 <b>${p.cycle}</b> 轮迭代规划（证据 ${p.evidence_before||0} → ${p.evidence_now||'…'}）`, 'cycle'); break;
     case 'oast_started':
@@ -548,7 +678,7 @@ async function pollEvents(force){
     if(force || !Object.keys(taskMap).length){
       const detail = await api('/api/runs/'+selectedRun);
       taskMap = {};
-      detail.tasks.forEach(tk=>{ taskMap[tk.id] = {kind: tk.kind, objective: tk.objective, status: tk.status}; });
+      detail.tasks.forEach(tk=>{ taskMap[tk.id] = {kind: tk.kind, objective: tk.objective, status: tk.status, agent: tk.agent}; });
     }
     const data = await api(`/api/runs/${selectedRun}/events?after=${evCount}`);
     evCount = data.total;
@@ -571,7 +701,7 @@ async function loadFindings(){
   try{
     const d = await api('/api/runs/'+selectedRun);
     taskMap = {};
-    d.tasks.forEach(tk=>{ taskMap[tk.id] = {kind: tk.kind, objective: tk.objective, status: tk.status}; });
+    d.tasks.forEach(tk=>{ taskMap[tk.id] = {kind: tk.kind, objective: tk.objective, status: tk.status, agent: tk.agent}; });
     const old = window._findings || [];
     d.findings.forEach(f=>{ const prev = old.find(x=>x.id===f.id); if(prev && prev._zh){ f._zh = prev._zh; f._zhBusy = prev._zhBusy; } });
     window._findings = d.findings;
@@ -665,8 +795,8 @@ async function showBrief(){
 function closeModal(){ $('overlay').classList.remove('show'); window._modalIdx = undefined; }
 
 /* ---------------- 设置面板 ---------------- */
-const ROLES = ['planner','pentester','reviewer','reporter'];
-const ROLE_ZH = {planner:'规划', pentester:'渗透', reviewer:'评审', reporter:'速览'};
+const ROLES = ['pentester'];
+const MODEL_ROLES = ['pentester', 'supervisor'];
 
 function setTheme(t, persist){
   document.documentElement.classList.toggle('dark', t==='dark');
@@ -683,8 +813,8 @@ async function openSettings(){
     $('s_key').value = '';
     $('s_keyhint').textContent = s.key_hint ? ('已配置 '+s.key_hint) : (s.key_set ? '已配置' : '未配置');
     $('s_provider').textContent = '· ' + (s.provider||'');
-    ROLES.forEach(r=>{ $('s_m_'+r).value = s.models[r] || ''; });
-    $('s_par').value = s.run.max_parallel; $('s_tasks').value = s.run.max_tasks;
+    MODEL_ROLES.forEach(r=>{ $('s_m_'+r).value = s.models[r] || ''; });
+    $('s_tasks').value = s.run.max_tasks;
     ROLES.forEach(r=>{
       const d = $('p_'+r);
       d.querySelector('textarea').value = s.instructions[r] || '';
@@ -712,14 +842,15 @@ async function saveSettings(){
   const key = $('s_key').value.trim();
   if(key) body.openrouter_key = key;
   let ok = true;
-  ROLES.forEach(r=>{
+  MODEL_ROLES.forEach(r=>{
     const m = $('s_m_'+r).value.trim();
     if(m) body.models[r] = m; else ok = false;
+  });
+  ROLES.forEach(r=>{
     const p = $('p_'+r).querySelector('textarea').value;
     body.instructions[r] = p.trim() ? p : '';   // 留空=恢复默认
   });
-  const par = parseInt($('s_par').value, 10), tsk = parseInt($('s_tasks').value, 10);
-  if(par>=1) body.run.max_parallel = par;
+  const tsk = parseInt($('s_tasks').value, 10);
   if(tsk>=1) body.run.max_tasks = tsk;
   if(!ok && !confirm('有角色模型为空，将保留当前值。继续？')) return;
   try{
@@ -732,11 +863,13 @@ async function saveSettings(){
 
 /* init */
 setTheme(localStorage.getItem('theme')||'light');
-refreshRuns(); loadKnowledge(); selectInitialRun();
+refreshProjects().then(()=>{ refreshRuns(); selectInitialRun(); });
+loadKnowledge();
 setInterval(()=>{ api('/api/state').then(s=>{ if(s.active_run_id){ refreshRuns(); pollEvents(); } }).catch(()=>{}); }, 8000);
 async function selectInitialRun(){
   try{
-    const d = await api('/api/runs');
+    const q = activeProject ? '/api/runs?project_id='+encodeURIComponent(activeProject.id) : '/api/runs';
+    const d = await api(q);
     if(d.runs.length) selectRun(d.runs[0].id);
   }catch(e){}
 }

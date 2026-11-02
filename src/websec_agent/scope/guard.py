@@ -79,6 +79,12 @@ class ScopeGuard:
         if not host:
             raise ScopeViolation(host, "empty host")
 
+        if self._policy.unrestricted:
+            # Operator-level policy: no host allowlist, no port list, no
+            # private-address blocking. Anything the project points at - and
+            # anything a redirect lands on - is reachable.
+            return host
+
         if any(_host_matches(pattern, host) for pattern in self._policy.denied_hosts):
             raise ScopeViolation(host, "host is explicitly denied")
 

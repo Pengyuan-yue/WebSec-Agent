@@ -15,6 +15,7 @@ powershell -NoProfile -Command "if(Test-NetConnection -ComputerName 127.0.0.1 -P
 if not errorlevel 1 set "HTTP_PROXY=http://127.0.0.1:7897" & set "HTTPS_PROXY=http://127.0.0.1:7897"
 
 :CHECK
+if exist "tools\pw-browsers" set "PLAYWRIGHT_BROWSERS_PATH=%CD%\tools\pw-browsers"
 if not exist ".venv\Scripts\websec-agent-web.exe" goto NOPY
 
 rem [3] start server

@@ -187,6 +187,29 @@ class EventRow(Base):
     )
 
 
+class ProjectRow(Base):
+    """A penetration-test project: one name plus many target URLs."""
+
+    __tablename__ = "projects"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    urls: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RunProjectRow(Base):
+    """Run -> project mapping (kept separate so old run rows stay valid)."""
+
+    __tablename__ = "run_projects"
+
+    run_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(40), nullable=False)
+
+    __table_args__ = (Index("ix_run_projects_project", "project_id"),)
+
+
 class MemoryRow(Base):
     __tablename__ = "memories"
 

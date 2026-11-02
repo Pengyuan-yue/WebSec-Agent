@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ..core.budget import BudgetGuard, BudgetSnapshot
-from ..core.errors import ConfigError, ProtocolError, ScopeViolation, WebSecError
+from ..core.errors import ConfigError, ConcurrentModification, ProtocolError, ScopeViolation, WebSecError
 from ..core.schemas import (
     AuditOutput,
     Budget,
@@ -18,16 +18,13 @@ from ..core.schemas import (
     Finding,
     FindingStatus,
     FindingSummary,
-    PlanOutput,
     ProposedFinding,
-    ReviewOutput,
-    ReviewRecord,
-    ReviewVerdictValue,
     Role,
     Run,
     RunBudget,
     RunStatus,
     Severity,
+    SupervisorOutput,
     Task,
     TaskKind,
     TaskStatus,
@@ -47,9 +44,7 @@ from ..tools.oast import OastChannel
 from .auditor import EvidenceAuditor
 from .context import compress_evidence, compress_list
 from .pentester import PentesterAgent
-from .planner import PlannerAgent
-from .reporter import ReporterAgent
-from .reviewer import ReviewerAgent
+from .supervisor import SupervisorAgent
 
 ANALYSIS_KINDS = {TaskKind.ANALYZE, TaskKind.EXPLOIT, TaskKind.VALIDATE}
 ACTIVE_STATUSES = {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}
@@ -58,23 +53,20 @@ MAX_EXCERPT_CHARS = 200_000
 MAX_CONTEXT_TASKS = 20
 MAX_TOOL_REQUESTS_PER_TURN = 3
 MAX_PROBES_PER_ENDPOINT = 3
-MAX_REWORKS_PER_FINDING = 2
-MAX_PLAN_CYCLES = 2
 # Kinds safe to dispatch concurrently: their handlers are LLM-bound (pure
 # network I/O) or subprocess-bound; all DB access is serialized by the
 # Database session lock. AUDIT and REPORT stay exclusive.
 PARALLEL_KINDS = {
-    TaskKind.PLAN,
     TaskKind.RECON,
     TaskKind.ANALYZE,
     TaskKind.EXPLOIT,
     TaskKind.VALIDATE,
-    TaskKind.REVIEW,
 }
 CONTEXT_CHARS_PER_TOKEN = 3.5
 CONTEXT_BUDGET_RATIO = 0.95
 CONTEXT_SAFETY_TOKENS = 4096
 MIN_CONTEXT_BUDGET_CHARS = 40_000
+MAX_SUPERVISOR_CALLS_PER_RUN = 8
 
 
 class Orchestrator:
@@ -94,7 +86,8 @@ class Orchestrator:
         self._target = target
         self._executor = executor
         self._registry = registry
-        self._run_budget = run_budget
+        # Four Pentester workers are a fixed part of this orchestration model.
+        self._run_budget = run_budget.model_copy(update={"max_parallel": 4})
         self._artifacts_root = Path(artifacts_root)
         self._repos = Repositories.build(db)
         self._guard = executor.guard
@@ -103,6 +96,11 @@ class Orchestrator:
         self._seen_tool_requests: dict[str, set[str]] = {}
         self._probe_counts: dict[str, dict[tuple[str, str], int]] = {}
         self._persist_lock = threading.RLock()
+        self._supervisor_lock = threading.RLock()
+        self._supervisor_directives: dict[int, dict[str, Any]] = {}
+        self._supervisor_calls: dict[str, int] = {}
+        self._supervisor_disabled = False
+        self._supervisor_budget_reported = False
 
         parsed = urlparse(target)
         self._target_host = parsed.hostname or ""
@@ -137,7 +135,7 @@ class Orchestrator:
         self._start_oast(run.id)
 
         pool = ThreadPoolExecutor(
-            max_workers=self._run_budget.max_parallel, thread_name_prefix="websec-dispatch"
+            max_workers=4, thread_name_prefix="websec-dispatch"
         )
         try:
             while True:
@@ -147,11 +145,15 @@ class Orchestrator:
 
                 ready = self._repos.tasks.list_by_status(run.id, TaskStatus.READY)
                 if not ready:
-                    if self._maybe_expand_plan(run.id):
-                        continue
                     if self._ensure_report_task(run.id):
                         continue
                     break
+
+                if self._supervisor_calls.get(run.id, 0) == 0 and any(
+                    task.inputs.get("pentester_slot") for task in ready
+                ):
+                    self._maybe_supervise(run.id, "initial_assignment")
+                    ready = self._repos.tasks.list_by_status(run.id, TaskStatus.READY)
 
                 if ready[0].kind != TaskKind.REPORT:
                     reason = self._budget.exhaustion_reason()
@@ -165,18 +167,41 @@ class Orchestrator:
                     task
                     for task in ready
                     if task.kind in PARALLEL_KINDS
-                ][: self._run_budget.max_parallel]
+                ][:4]
                 if len(batch) <= 1:
-                    self._dispatch(ready[0])
+                    candidate = ready[0]
+                    self._dispatch(candidate)
+                    if candidate.kind in ANALYSIS_KINDS and candidate.inputs.get("pentester_slot"):
+                        self._maybe_supervise(
+                            run.id,
+                            f"worker_checkpoint:{candidate.inputs.get('pentester_slot')}",
+                        )
                     continue
                 self._event(
                     run.id,
                     "dispatch_parallel",
-                    {"task_ids": [task.id for task in batch], "kinds": [t.kind.value for t in batch]},
+                    {
+                        "task_ids": [task.id for task in batch],
+                        "kinds": [t.kind.value for t in batch],
+                        "agents": [
+                            t.inputs.get("pentester_label")
+                            for t in batch
+                            if t.inputs.get("pentester_label")
+                        ],
+                    },
                 )
-                futures = [pool.submit(self._dispatch, task) for task in batch]
-                for future in as_completed(futures):
+                future_tasks = {pool.submit(self._dispatch, task): task for task in batch}
+                for future in as_completed(future_tasks):
                     future.result()
+                    completed_task = future_tasks[future]
+                    if (
+                        completed_task.kind in ANALYSIS_KINDS
+                        and completed_task.inputs.get("pentester_slot")
+                    ):
+                        self._maybe_supervise(
+                            run.id,
+                            f"worker_checkpoint:{completed_task.inputs.get('pentester_slot')}",
+                        )
         finally:
             pool.shutdown(wait=True)
 
@@ -261,6 +286,7 @@ class Orchestrator:
 
     # --------------------------------------------------------------- seeding
 
+
     def _seed_initial_tasks(self, run_id: str) -> None:
         url = self._target
         origin = f"{self._target_scheme}://{urlparse(url).netloc}"
@@ -269,7 +295,9 @@ class Orchestrator:
             (
                 "Baseline HTTP fetch of the target",
                 ToolRequest(
-                    tool=ToolName.HTTP_REQUEST, params={"url": url, "method": "GET"}, reason="baseline"
+                    tool=ToolName.HTTP_REQUEST,
+                    params={"url": url, "method": "GET"},
+                    reason="baseline",
                 ),
             ),
         ]
@@ -286,22 +314,25 @@ class Orchestrator:
                 )
             )
 
-        recon_specs.append(
-            (
-                "Fetch robots.txt",
-                ToolRequest(
-                    tool=ToolName.ROBOTS, params={"url": f"{origin}/robots.txt"}, reason="baseline"
+        recon_specs.extend(
+            [
+                (
+                    "Fetch robots.txt",
+                    ToolRequest(
+                        tool=ToolName.ROBOTS,
+                        params={"url": f"{origin}/robots.txt"},
+                        reason="baseline",
+                    ),
                 ),
-            )
-        )
-
-        recon_specs.append(
-            (
-                "Resolve target DNS records",
-                ToolRequest(
-                    tool=ToolName.DNS_LOOKUP, params={"host": self._target_host}, reason="baseline"
+                (
+                    "Resolve target DNS records",
+                    ToolRequest(
+                        tool=ToolName.DNS_LOOKUP,
+                        params={"host": self._target_host},
+                        reason="baseline",
+                    ),
                 ),
-            )
+            ]
         )
 
         recon_ids: list[str] = []
@@ -318,21 +349,25 @@ class Orchestrator:
             )
             recon_ids.append(task.id)
 
-        self._create_task(
-            run_id,
-            kind=TaskKind.PLAN,
-            role=Role.PLANNER,
-            objective=(
-                "Plan a security assessment that finds ALL high-severity vulnerabilities "
-                "(critical and high) in the target. Medium and lower severity are out of scope."
-            ),
-            inputs={},
-            depends_on=recon_ids,
-            priority=70,
-            status=TaskStatus.PENDING,
-        )
-
-    # ------------------------------------------------------------ task state
+        # Baseline recon finishes first. The Supervisor assigns the initial
+        # objectives before any Pentester starts; workers do not self-select lanes.
+        pentester_lanes = [
+            ("Pentester 1", "Await Supervisor assignment for worker slot 1."),
+            ("Pentester 2", "Await Supervisor assignment for worker slot 2."),
+            ("Pentester 3", "Await Supervisor assignment for worker slot 3."),
+            ("Pentester 4", "Await Supervisor assignment for worker slot 4."),
+        ]
+        for slot, (label, objective) in enumerate(pentester_lanes, start=1):
+            self._create_task(
+                run_id,
+                kind=TaskKind.ANALYZE,
+                role=Role.PENTESTER,
+                objective=objective,
+                inputs={"pentester_slot": slot, "pentester_label": label},
+                depends_on=recon_ids,
+                priority=70,
+                status=TaskStatus.PENDING,
+            )
 
     def _create_task(
         self,
@@ -369,6 +404,7 @@ class Orchestrator:
                 "kind": kind.value,
                 "role": role.value,
                 "status": status.value,
+                "agent": inputs.get("pentester_label"),
             },
             task_id=task.id,
         )
@@ -391,14 +427,6 @@ class Orchestrator:
         task.error = reason
         self._update_task(task, TaskStatus.SKIPPED, reason)
 
-    def _is_freshly_reviewed(self, run_id: str, finding: Finding) -> bool:
-        """True when the finding has a review newer than its last content update."""
-        reviews = self._repos.reviews.list_for_finding(run_id, finding.id)
-        if not reviews:
-            return False
-        last_review_at = max(review.created_at for review in reviews)
-        return last_review_at >= finding.updated_at
-
     def _refresh_dependencies(self, run_id: str) -> None:
         tasks = self._repos.tasks.list_by_run(run_id)
         by_id = {task.id: task for task in tasks}
@@ -414,61 +442,270 @@ class Orchestrator:
 
     # ------------------------------------------------------------- scheduling
 
+    def _maybe_supervise(self, run_id: str, checkpoint: str) -> None:
+        """Run a bounded Supervisor checkpoint and update only unstarted lane work."""
+        if self._supervisor_disabled:
+            return
+        calls = self._supervisor_calls.get(run_id, 0)
+        if calls >= MAX_SUPERVISOR_CALLS_PER_RUN:
+            if not self._supervisor_budget_reported:
+                self._supervisor_budget_reported = True
+                self._event(
+                    run_id,
+                    "supervisor_budget_exhausted",
+                    {"limit": MAX_SUPERVISOR_CALLS_PER_RUN},
+                )
+            return
+
+        tasks = self._repos.tasks.list_by_run(run_id)
+        lane_tasks = [
+            task for task in tasks
+            if task.kind in ANALYSIS_KINDS and task.inputs.get("pentester_slot") in {1, 2, 3, 4}
+        ]
+        if not lane_tasks or not any(
+            task.status in {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}
+            for task in lane_tasks
+        ):
+            return
+
+        try:
+            self._registry.resolve(Role.SUPERVISOR)
+        except Exception as exc:  # noqa: BLE001 - deterministic lane split remains available
+            self._supervisor_disabled = True
+            self._event(
+                run_id,
+                "supervisor_unavailable",
+                {"reason": f"{type(exc).__name__}: {exc}"[:240]},
+            )
+            return
+
+        if self._budget is not None and self._budget.exhaustion_reason():
+            return
+
+        self._supervisor_calls[run_id] = calls + 1
+        supervisor_task = Task(
+            run_id=run_id,
+            kind=TaskKind.SUPERVISE,
+            role=Role.SUPERVISOR,
+            objective="Coordinate the four Pentester lanes using the latest checkpoint state.",
+            inputs={"checkpoint": checkpoint, "checkpoint_number": calls + 1},
+            status=TaskStatus.RUNNING,
+        )
+        try:
+            output = self._call_agent(
+                SupervisorAgent(),
+                supervisor_task,
+                self._supervisor_context(run_id, checkpoint),
+            )
+            if not isinstance(output, SupervisorOutput):
+                output = SupervisorOutput.model_validate(output)
+            supervisor_task.status = TaskStatus.DONE
+            supervisor_task.attempts = 1
+            supervisor_task.result = output.model_dump(mode="json")
+            self._repos.tasks.create(supervisor_task)
+            self._apply_supervisor_output(run_id, output)
+            self._event(
+                run_id,
+                "supervisor_completed",
+                {
+                    "supervisor_task_id": supervisor_task.id,
+                    "checkpoint": checkpoint,
+                    "summary": output.summary,
+                    "assignments": len(output.assignments),
+                    "overlap_warnings": output.overlap_warnings,
+                },
+                task_id=supervisor_task.id,
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the four deterministic lanes
+            self._supervisor_disabled = True
+            self._event(
+                run_id,
+                "supervisor_failed",
+                {
+                    "supervisor_task_id": supervisor_task.id,
+                    "checkpoint": checkpoint,
+                    "reason": f"{type(exc).__name__}: {exc}"[:400],
+                    "fallback": "keep_existing_four_lane_assignments",
+                },
+                task_id=supervisor_task.id,
+            )
+
+    def _supervisor_context(self, run_id: str, checkpoint: str) -> dict[str, Any]:
+        tasks = self._repos.tasks.list_by_run(run_id)
+        findings = self._repos.findings.list_by_run(run_id)
+        evidence = self._repos.evidence.list_by_run(run_id)
+        return {
+            "target": self._target,
+            "authorized_scope": self._guard.snapshot(),
+            "checkpoint": checkpoint,
+            "lanes": self._worker_roster_context(tasks, None),
+            "findings": [
+                {
+                    "title": item.title,
+                    "category": item.category,
+                    "severity": item.severity.value,
+                    "status": item.status.value,
+                    "task_id": item.task_id,
+                }
+                for item in findings[-40:]
+            ],
+            "evidence_inventory": [
+                {
+                    "kind": item.kind.value,
+                    "source_url": item.source_url,
+                    "method": item.method,
+                    "summary": item.summary[:240],
+                }
+                for item in evidence[-60:]
+            ],
+            "constraints": {
+                "worker_slots": 4,
+                "max_parallel": 4,
+                "running_tasks_are_immutable": True,
+                "supervisor_may_only_guide_unstarted_work": True,
+            },
+        }
+
+    def _apply_supervisor_output(self, run_id: str, output: SupervisorOutput) -> None:
+        tasks = self._repos.tasks.list_by_run(run_id)
+        seen_slots: set[int] = set()
+        focus_owners: dict[str, int] = {}
+        for directive in output.assignments:
+            if directive.slot in seen_slots:
+                continue
+            seen_slots.add(directive.slot)
+            payload = directive.model_dump(mode="json")
+            unique_focus: list[str] = []
+            for item in payload.get("focus", []):
+                normalized = " ".join(str(item).casefold().split())
+                if not normalized or normalized in focus_owners:
+                    continue
+                focus_owners[normalized] = directive.slot
+                unique_focus.append(str(item))
+            payload["focus"] = unique_focus
+            with self._supervisor_lock:
+                self._supervisor_directives[directive.slot] = payload
+
+            updated = 0
+            for candidate in tasks:
+                if candidate.inputs.get("pentester_slot") != directive.slot:
+                    continue
+                if candidate.status not in {TaskStatus.PENDING, TaskStatus.READY}:
+                    continue
+                latest = self._repos.tasks.get(candidate.id)
+                if latest is None or latest.status not in {TaskStatus.PENDING, TaskStatus.READY}:
+                    continue
+                if latest.inputs.get("supervisor_directive") == payload:
+                    continue
+                latest.inputs = {**latest.inputs, "supervisor_directive": payload}
+                latest.objective = directive.objective
+                try:
+                    self._repos.tasks.update(latest)
+                    updated += 1
+                except ConcurrentModification:
+                    # A worker claimed the task concurrently; never overwrite in-progress work.
+                    continue
+            self._event(
+                run_id,
+                "supervisor_assignment_applied",
+                {
+                    "slot": directive.slot,
+                    "focus": payload["focus"],
+                    "avoid": payload["avoid"],
+                    "guidance": payload["guidance"],
+                    "updated_unstarted_tasks": updated,
+                },
+            )
+
+    def _worker_roster_context(
+        self, tasks: list[Task], current_slot: int | None
+    ) -> list[dict[str, Any]]:
+        roster: list[dict[str, Any]] = []
+        for slot in range(1, 5):
+            lane = [
+                task for task in tasks
+                if task.kind in ANALYSIS_KINDS and task.inputs.get("pentester_slot") == slot
+            ]
+            if not lane:
+                continue
+            lane.sort(key=lambda item: (item.created_at, item.id))
+            latest = lane[-1]
+            summaries = [
+                str(item.result.get("summary", ""))[:400]
+                for item in lane
+                if item.status == TaskStatus.DONE
+                and isinstance(item.result, dict)
+                and item.result.get("summary")
+            ][-3:]
+            with self._supervisor_lock:
+                directive = dict(self._supervisor_directives.get(slot, {}))
+            roster.append(
+                {
+                    "slot": slot,
+                    "label": latest.inputs.get("pentester_label", f"Pentester {slot}"),
+                    "status": latest.status.value,
+                    "current_objective": latest.objective,
+                    "active": any(item.status == TaskStatus.RUNNING for item in lane),
+                    "unstarted_task_ids": [
+                        item.id for item in lane
+                        if item.status in {TaskStatus.PENDING, TaskStatus.READY}
+                    ],
+                    "completed_summaries": summaries,
+                    "supervisor_directive": directive,
+                    "is_current_worker": slot == current_slot,
+                }
+            )
+        return roster
+
     def _schedule_followups(self, run_id: str) -> None:
+        """Schedule one deterministic evidence-integrity audit after Pentester work settles."""
         tasks = self._repos.tasks.list_by_run(run_id)
         findings = self._repos.findings.list_by_run(run_id)
         audited_ids = self._repos.audits.audited_finding_ids(run_id)
 
-        active_review = any(
-            task.kind == TaskKind.REVIEW and task.status in ACTIVE_STATUSES for task in tasks
+        active_work = any(
+            task.kind in (ANALYSIS_KINDS | {TaskKind.RECON})
+            and task.status in ACTIVE_STATUSES
+            for task in tasks
         )
         active_audit = any(
             task.kind == TaskKind.AUDIT and task.status in ACTIVE_STATUSES for task in tasks
         )
+        if active_work or active_audit:
+            return
 
-        unreviewed = [
-            finding
-            for finding in findings
-            if finding.status == FindingStatus.PROPOSED
-            and not self._is_freshly_reviewed(run_id, finding)
-        ]
-        if unreviewed and not active_review:
-            analysis_ids = [
-                task.id
-                for task in tasks
-                if task.kind in ANALYSIS_KINDS and task.status != TaskStatus.SKIPPED
-            ]
-            self._create_task(
-                run_id,
-                kind=TaskKind.REVIEW,
-                role=Role.REVIEWER,
-                objective="Independently review proposed findings against collected evidence.",
-                inputs={"finding_ids": [finding.id for finding in unreviewed]},
-                depends_on=analysis_ids,
-                priority=60,
-            )
-
+        attempted_ids = {
+            finding_id
+            for task in tasks
+            if task.kind == TaskKind.AUDIT
+            for finding_id in (task.inputs.get("finding_ids") or [])
+        }
         unaudited = [
             finding
             for finding in findings
             if finding.status in {FindingStatus.CONFIRMED, FindingStatus.UNCERTAIN}
             and finding.id not in audited_ids
+            and finding.id not in attempted_ids
         ]
-        if unaudited and not unreviewed and not active_review and not active_audit:
-            review_ids = [
-                task.id
-                for task in tasks
-                if task.kind == TaskKind.REVIEW and task.status == TaskStatus.DONE
-            ]
-            self._create_task(
-                run_id,
-                kind=TaskKind.AUDIT,
-                role=Role.AUDITOR,
-                objective="Programmatically audit evidence hashes, scope flags and finding completeness.",
-                inputs={"finding_ids": [finding.id for finding in unaudited]},
-                depends_on=review_ids,
-                priority=58,
-            )
+        if not unaudited:
+            return
+
+        work_ids = [
+            task.id
+            for task in tasks
+            if task.kind in (ANALYSIS_KINDS | {TaskKind.RECON})
+            and task.status != TaskStatus.SKIPPED
+        ]
+        self._create_task(
+            run_id,
+            kind=TaskKind.AUDIT,
+            role=Role.SYSTEM,
+            objective="Programmatically audit evidence hashes, scope flags and finding completeness.",
+            inputs={"finding_ids": [finding.id for finding in unaudited]},
+            depends_on=work_ids,
+            priority=58,
+        )
+
 
     def _ensure_report_task(self, run_id: str) -> bool:
         tasks = self._repos.tasks.list_by_run(run_id)
@@ -477,85 +714,23 @@ class Orchestrator:
         self._create_task(
             run_id,
             kind=TaskKind.REPORT,
-            role=Role.REPORTER,
-            objective="Generate the structured report and executive summary.",
+            role=Role.SYSTEM,
+            objective="Generate the report deterministically from persisted evidence and findings.",
             inputs={},
             depends_on=[task.id for task in tasks],
             priority=5,
         )
         return True
 
-    def _maybe_expand_plan(self, run_id: str) -> bool:
-        """Iterative planning: once a cycle quiets down, plan the next wave.
-
-        Fires only when every task is terminal, evidence has grown since the
-        last plan ran, and the budget still has room. Capped at MAX_PLAN_CYCLES
-        plan tasks per run so the loop always terminates.
-        """
-        tasks = self._repos.tasks.list_by_run(run_id)
-        if any(task.status in ACTIVE_STATUSES for task in tasks):
-            return False
-        if any(task.kind == TaskKind.REPORT for task in tasks):
-            return False
-        plan_tasks = [task for task in tasks if task.kind == TaskKind.PLAN]
-        if len(plan_tasks) >= MAX_PLAN_CYCLES:
-            return False
-        if self._budget is None or self._budget.exhaustion_reason():
-            return False
-
-        latest_plan = plan_tasks[-1]
-        evidence_before = int((latest_plan.result or {}).get("evidence_count") or 0)
-        evidence_now = self._repos.evidence.count_by_run(run_id)
-        if evidence_now <= evidence_before:
-            return False
-
-        findings = self._repos.findings.list_by_run(run_id)
-        confirmed = sum(1 for f in findings if f.status == FindingStatus.CONFIRMED)
-        cycle = len(plan_tasks) + 1
-        self._create_task(
-            run_id,
-            kind=TaskKind.PLAN,
-            role=Role.PLANNER,
-            objective=(
-                f"Extend the assessment (plan cycle {cycle} of {MAX_PLAN_CYCLES}). The previous "
-                f"cycle finished with {evidence_now} evidence items and {len(findings)} finding(s) "
-                f"({confirmed} confirmed). Review the new evidence and findings in context and "
-                "plan the NEXT wave of tasks to expand the attack surface: endpoints not yet "
-                "probed, deeper exploitation chains (e.g. authenticated traversal, IDOR with the "
-                "confirmed access), and lateral follow-ups of partially-explored areas. Do not "
-                "re-plan work already covered by confirmed findings."
-            ),
-            inputs={"plan_cycle": cycle, "previous_plan_task": latest_plan.id},
-            depends_on=[],
-            priority=70,
-            status=TaskStatus.READY,
-        )
-        self._event(
-            run_id,
-            "plan_cycle_created",
-            {
-                "cycle": cycle,
-                "previous_plan_task": latest_plan.id,
-                "evidence_before": evidence_before,
-                "evidence_now": evidence_now,
-            },
-        )
-        return True
-
-    # --------------------------------------------------------------- dispatch
 
     def _dispatch(self, task: Task) -> None:
         task.attempts += 1
         self._update_task(task, TaskStatus.RUNNING)
         try:
-            if task.kind == TaskKind.PLAN:
-                result = self._handle_plan(task)
-            elif task.kind == TaskKind.RECON:
+            if task.kind == TaskKind.RECON:
                 result = self._handle_recon(task)
             elif task.kind in ANALYSIS_KINDS:
                 result = self._handle_pentest(task)
-            elif task.kind == TaskKind.REVIEW:
-                result = self._handle_review(task)
             elif task.kind == TaskKind.AUDIT:
                 result = self._handle_audit(task)
             elif task.kind == TaskKind.REPORT:
@@ -585,108 +760,6 @@ class Orchestrator:
 
     # ---------------------------------------------------------------- handlers
 
-    def _handle_plan(self, task: Task) -> dict[str, Any]:
-        output: PlanOutput = self._call_agent(PlannerAgent(), task, self._context(task))
-        evidence_count = self._repos.evidence.count_by_run(task.run_id)
-        key_to_id: dict[str, str] = {}
-        created = 0
-        allowed_roles = {Role.PENTESTER}
-
-        if not output.tasks:
-            self._event(
-                task.run_id,
-                "plan_empty",
-                {"rationale": output.rationale[:300]},
-                task_id=task.id,
-            )
-            child = self._create_task(
-                task.run_id,
-                kind=TaskKind.ANALYZE,
-                role=Role.PENTESTER,
-                objective=(
-                    "Analyze all collected recon evidence, identify high-severity attack "
-                    "surface (login, search, API, admin paths), and test it with http_request "
-                    "or external_tool probes."
-                ),
-                inputs={},
-                depends_on=[task.id],
-                priority=50,
-                parent_id=task.id,
-            )
-            key_to_id["fallback-analysis"] = child.id
-            created += 1
-            return {
-                "rationale": output.rationale,
-                "planned_keys": key_to_id,
-                "tasks_created": created,
-                "tasks_proposed": 0,
-                "empty_plan_fallback": True,
-                "evidence_count": evidence_count,
-            }
-
-        for planned in output.tasks:
-            if planned.key in key_to_id:
-                self._event(
-                    task.run_id,
-                    "plan_task_rejected",
-                    {"feature": "duplicate_key", "value": planned.key},
-                    task_id=task.id,
-                )
-                continue
-            if planned.kind not in {TaskKind.RECON, TaskKind.ANALYZE, TaskKind.EXPLOIT, TaskKind.VALIDATE}:
-                self._event(
-                    task.run_id,
-                    "plan_task_rejected",
-                    {"feature": "kind", "value": planned.kind.value, "key": planned.key},
-                    task_id=task.id,
-                )
-                continue
-            if planned.role not in allowed_roles:
-                self._event(
-                    task.run_id,
-                    "plan_task_rejected",
-                    {"feature": "role", "value": planned.role.value, "key": planned.key},
-                    task_id=task.id,
-                )
-                continue
-            resolved_deps: list[str] = []
-            invalid_dep = None
-            for key in planned.depends_on:
-                if key not in key_to_id:
-                    invalid_dep = key
-                    break
-                resolved_deps.append(key_to_id[key])
-            if invalid_dep is not None:
-                self._event(
-                    task.run_id,
-                    "plan_task_rejected",
-                    {"feature": "depends_on", "value": invalid_dep, "key": planned.key},
-                    task_id=task.id,
-                )
-                continue
-
-            child = self._create_task(
-                task.run_id,
-                kind=planned.kind,
-                role=planned.role,
-                objective=planned.objective,
-                inputs=planned.inputs,
-                depends_on=resolved_deps + [task.id],
-                priority=planned.priority,
-                parent_id=task.id,
-                budget=planned.budget,
-            )
-            key_to_id[planned.key] = child.id
-            created += 1
-
-        return {
-            "rationale": output.rationale,
-            "planned_keys": key_to_id,
-            "tasks_created": created,
-            "tasks_proposed": len(output.tasks),
-            "evidence_count": evidence_count,
-        }
-
     def _handle_recon(self, task: Task) -> dict[str, Any]:
         raw_request = task.inputs.get("request")
         if not isinstance(raw_request, dict):
@@ -712,7 +785,17 @@ class Orchestrator:
         }
 
     def _handle_pentest(self, task: Task) -> dict[str, Any]:
-        output = self._call_agent(PentesterAgent(), task, self._context(task))
+        context = self._context(task)
+        directive = context.get("supervisor_guidance")
+        agent_task = task
+        if isinstance(directive, dict) and directive:
+            guidance_lines = [
+                "Supervisor guidance for this checkpoint (coordination only):",
+                f"Focus: {', '.join(directive.get('focus') or [])}",
+                f"Avoid duplicating: {', '.join(directive.get('avoid') or [])}",
+                f"Guidance: {directive.get('guidance', '')}",
+            ]
+        output = self._call_agent(PentesterAgent(), agent_task, context)
 
         with self._persist_lock:
             rework_finding_id = task.inputs.get("rework_finding_id")
@@ -805,7 +888,7 @@ class Orchestrator:
             evidence_ids=evidence_ids,
             reproduction=proposed.reproduction,
             remediation=proposed.remediation,
-            status=FindingStatus.PROPOSED,
+            status=FindingStatus.CONFIRMED,
             created_by=Role.PENTESTER,
         )
         self._repos.findings.create(finding)
@@ -928,6 +1011,11 @@ class Orchestrator:
                 task_id=task.id,
             )
 
+        # No newly scheduled collection means no new evidence can arrive; do not
+        # spin a follow-up Pentester task on requests already deduplicated.
+        if not child_ids:
+            return child_ids, None
+
         if self._budget.replan_limit_reached(self._repos.tasks.replan_count(task.run_id)):
             self._event(
                 task.run_id,
@@ -946,6 +1034,16 @@ class Orchestrator:
                 " citing the existing evidence, or state precisely what decisive signal is missing."
             )
         followup_inputs = {"followup": True, "origin_task": task.id, "origin_objective": task.objective}
+        for key in ("pentester_slot", "pentester_label"):
+            if key in task.inputs:
+                followup_inputs[key] = task.inputs[key]
+        slot = task.inputs.get("pentester_slot")
+        directive = task.inputs.get("supervisor_directive")
+        if not isinstance(directive, dict) and isinstance(slot, int):
+            with self._supervisor_lock:
+                directive = self._supervisor_directives.get(slot)
+        if isinstance(directive, dict):
+            followup_inputs["supervisor_directive"] = dict(directive)
         if isinstance(task.inputs.get("rework_finding_id"), str):
             followup_inputs["rework_finding_id"] = task.inputs["rework_finding_id"]
             followup_inputs["missing_evidence"] = task.inputs.get("missing_evidence", [])
@@ -967,151 +1065,6 @@ class Orchestrator:
             task_id=task.id,
         )
         return child_ids, followup.id
-
-    def _handle_review(self, task: Task) -> dict[str, Any]:
-        target_ids = list(task.inputs.get("finding_ids") or [])
-        findings = [
-            finding
-            for finding in (self._repos.findings.get(task.run_id, fid) for fid in target_ids)
-            if finding is not None
-        ]
-        if not findings:
-            return {"verdicts": 0, "note": "no findings to review"}
-
-        output: ReviewOutput = self._call_agent(
-            ReviewerAgent(), task, self._context(task, findings_override=findings)
-        )
-
-        with self._persist_lock:
-            seen: set[str] = set()
-            counts: dict[str, int] = {}
-            needs_evidence_items: list[tuple[Any, Finding]] = []
-            status_map = {
-                ReviewVerdictValue.CONFIRM: FindingStatus.CONFIRMED,
-                ReviewVerdictValue.REJECT: FindingStatus.REJECTED,
-                ReviewVerdictValue.NEEDS_EVIDENCE: FindingStatus.UNCERTAIN,
-            }
-            for verdict in output.verdicts:
-                if verdict.finding_id not in target_ids or verdict.finding_id in seen:
-                    self._event(
-                        task.run_id,
-                        "review_verdict_ignored",
-                        {"finding_id": verdict.finding_id},
-                        task_id=task.id,
-                    )
-                    continue
-                seen.add(verdict.finding_id)
-                review = ReviewRecord(
-                    run_id=task.run_id,
-                    task_id=task.id,
-                    finding_id=verdict.finding_id,
-                    verdict=verdict.verdict,
-                    rationale=verdict.rationale,
-                    cited_evidence_ids=verdict.cited_evidence_ids,
-                    missing_evidence=verdict.missing_evidence,
-                )
-                self._repos.reviews.create(review)
-                counts[verdict.verdict.value] = counts.get(verdict.verdict.value, 0) + 1
-                finding = self._repos.findings.get(task.run_id, verdict.finding_id)
-                if finding is not None:
-                    new_status = status_map[verdict.verdict]
-                    self._repos.findings.set_status(task.run_id, finding.id, new_status)
-                    self._event(
-                        task.run_id,
-                        "finding_status_changed",
-                        {
-                            "finding_id": finding.id,
-                            "status": new_status.value,
-                            "source": "review",
-                        },
-                        task_id=task.id,
-                    )
-                    if verdict.verdict is ReviewVerdictValue.NEEDS_EVIDENCE:
-                        needs_evidence_items.append((verdict, finding))
-
-            for finding_id in target_ids:
-                if finding_id in seen:
-                    continue
-                finding = self._repos.findings.get(task.run_id, finding_id)
-                if finding is None:
-                    continue
-                self._repos.findings.set_status(task.run_id, finding_id, FindingStatus.UNCERTAIN)
-                self._event(
-                    task.run_id,
-                    "finding_status_changed",
-                    {"finding_id": finding_id, "status": "uncertain", "source": "review_missing"},
-                    task_id=task.id,
-                )
-
-            rework_task_ids = self._create_rework_tasks(task, needs_evidence_items)
-
-            return {
-                "verdicts": len(seen),
-                "counts": counts,
-                "notes": output.notes,
-                "rework_task_ids": rework_task_ids,
-            }
-
-    def _create_rework_tasks(
-        self, task: Task, needs_evidence_items: list[tuple[Any, Finding]]
-    ) -> list[str]:
-        """Turn needs_evidence verdicts into pentester rework tasks (bounded)."""
-        rework_ids: list[str] = []
-        for verdict, finding in needs_evidence_items:
-            reviews = self._repos.reviews.list_for_finding(task.run_id, finding.id)
-            sendbacks = sum(
-                1 for review in reviews if review.verdict is ReviewVerdictValue.NEEDS_EVIDENCE
-            )
-            if sendbacks > MAX_REWORKS_PER_FINDING:
-                self._event(
-                    task.run_id,
-                    "rework_limit_reached",
-                    {
-                        "finding_id": finding.id,
-                        "sendbacks": sendbacks,
-                        "limit": MAX_REWORKS_PER_FINDING,
-                    },
-                    task_id=task.id,
-                )
-                continue
-
-            missing = "; ".join(verdict.missing_evidence) if verdict.missing_evidence else "see rationale"
-            rework = self._create_task(
-                task.run_id,
-                kind=TaskKind.VALIDATE,
-                role=Role.PENTESTER,
-                objective=(
-                    f"Rework finding '{finding.title}' (severity {finding.severity.value}): "
-                    "the independent reviewer judged the current evidence insufficient. "
-                    f"Reviewer rationale: {verdict.rationale} "
-                    f"Missing evidence: {missing}. "
-                    "Collect exactly the missing decisive evidence, then resubmit the SAME finding "
-                    "(same title and category) so the new evidence IDs are merged into it for "
-                    "re-review. If the evidence cannot be collected, explain precisely why in "
-                    "your summary."
-                ),
-                inputs={
-                    "rework_finding_id": finding.id,
-                    "review_rationale": verdict.rationale,
-                    "missing_evidence": list(verdict.missing_evidence),
-                    "rework_attempt": sendbacks,
-                },
-                depends_on=[task.id],
-                priority=55,
-                parent_id=task.id,
-            )
-            rework_ids.append(rework.id)
-            self._event(
-                task.run_id,
-                "rework_created",
-                {
-                    "finding_id": finding.id,
-                    "rework_task_id": rework.id,
-                    "attempt": sendbacks,
-                },
-                task_id=task.id,
-            )
-        return rework_ids
 
     def _handle_audit(self, task: Task) -> dict[str, Any]:
         target_ids = list(task.inputs.get("finding_ids") or [])
@@ -1146,6 +1099,7 @@ class Orchestrator:
         )
         return output.model_dump(mode="json")
 
+
     def _handle_report(self, task: Task) -> dict[str, Any]:
         run = self._repos.runs.get(task.run_id)
         if run is None:
@@ -1159,68 +1113,26 @@ class Orchestrator:
         tasks = self._repos.tasks.list_by_run(task.run_id)
         events = self._repos.events.list_by_run(task.run_id)
 
-        summary_generated = False
-        summary = ""
-        exhaustion = self._budget.exhaustion_reason() if self._budget else None
-        if exhaustion is None:
-            try:
-                report_context = {
-                    "target": self._target,
-                    "findings": [
-                        self._finding_summary(finding).model_dump(mode="json")
-                        for finding in findings
-                    ],
-                    "reviews": [
-                        {
-                            "finding_id": review.finding_id,
-                            "verdict": review.verdict.value,
-                            "rationale": review.rationale,
-                        }
-                        for review in reviews
-                    ],
-                    "failed_audits": [
-                        {"finding_id": check.finding_id, "check": check.check, "detail": check.detail}
-                        for check in audits
-                        if not check.passed
-                    ],
-                    "task_stats": compute_stats(tasks, evidence, findings, calls),
-                    "failed_tasks": [
-                        {"kind": item.kind.value, "objective": item.objective, "error": item.error}
-                        for item in tasks
-                        if item.status == TaskStatus.FAILED
-                    ],
-                    "skipped_tasks": [
-                        {"kind": item.kind.value, "objective": item.objective, "error": item.error}
-                        for item in tasks
-                        if item.status == TaskStatus.SKIPPED
-                    ],
-                    "budget": self._run_budget.model_dump(),
-                }
-                output = self._call_agent(ReporterAgent(), task, report_context)
-                summary = output.summary_markdown
-                summary_generated = True
-            except Exception as exc:  # noqa: BLE001 - report must still be written
-                self._event(
-                    task.run_id,
-                    "report_llm_failed",
-                    {"error": str(exc)[:500]},
-                    task_id=task.id,
-                )
+        confirmed = sum(1 for finding in findings if finding.status == FindingStatus.CONFIRMED)
+        uncertain = sum(1 for finding in findings if finding.status == FindingStatus.UNCERTAIN)
+        rejected = sum(
+            1
+            for finding in findings
+            if finding.status in {FindingStatus.REJECTED, FindingStatus.DUPLICATE}
+        )
+        failed = sum(1 for item in tasks if item.status == TaskStatus.FAILED)
+        skipped = sum(1 for item in tasks if item.status == TaskStatus.SKIPPED)
+        summary = (
+            f"本次对目标 {self._target} 的安全评估共形成 {len(findings)} 项发现："
+            f"已确认 {confirmed} 项，待核实 {uncertain} 项，已排除 {rejected} 项。"
+        )
+        if failed or skipped:
+            summary += (
+                f" 执行过程中有 {failed} 个任务失败、{skipped} 个任务因预算或依赖原因跳过，"
+                "分析完整性需结合任务记录判断。"
+            )
         else:
-            self._event(
-                task.run_id,
-                "report_llm_skipped",
-                {"reason": exhaustion},
-                task_id=task.id,
-            )
-
-        if not summary:
-            confirmed = sum(1 for finding in findings if finding.status == FindingStatus.CONFIRMED)
-            summary = (
-                f"Automated assessment of {self._target} produced {len(findings)} finding(s), "
-                f"{confirmed} confirmed after independent review and evidence audit. "
-                "See the structured findings below; analysis completeness is reported separately."
-            )
+            summary += " 所有调度任务均已完成。"
 
         final_tasks = [
             item.model_copy(update={"status": TaskStatus.DONE}) if item.id == task.id else item
@@ -1250,17 +1162,20 @@ class Orchestrator:
         self._event(
             task.run_id,
             "report_written",
-            {"report_dir": str(report_dir), "summary_generated": summary_generated},
+            {
+                "report_dir": str(report_dir),
+                "summary_generated": True,
+                "generator": "deterministic",
+            },
             task_id=task.id,
         )
         return {
             "report_dir": str(report_dir),
-            "summary_generated": summary_generated,
+            "summary_generated": True,
+            "generator": "deterministic",
             "findings": len(findings),
             "evidence": len(evidence),
         }
-
-    # ----------------------------------------------------------------- utils
 
     def _call_agent(self, agent, task: Task, context: dict[str, Any]):
         assert self._budget is not None
@@ -1349,8 +1264,23 @@ class Orchestrator:
             "max_replans": self._run_budget.max_replans,
             "external_tools": self._external_tools_context(),
             "cross_run_knowledge": self._knowledge_context(),
+            "supervisor_guidance": (
+                task.inputs.get("supervisor_directive")
+                if isinstance(task.inputs.get("supervisor_directive"), dict)
+                else self._current_supervisor_directive(task.inputs.get("pentester_slot"))
+            ),
+            "worker_roster": self._worker_roster_context(
+                tasks,
+                task.inputs.get("pentester_slot") if isinstance(task.inputs.get("pentester_slot"), int) else None,
+            ),
             "oast_callback_url": self._oast.url if self._oast_started else None,
         }
+
+    def _current_supervisor_directive(self, slot: Any) -> dict[str, Any]:
+        if not isinstance(slot, int):
+            return {}
+        with self._supervisor_lock:
+            return dict(self._supervisor_directives.get(slot, {}))
 
     def _knowledge_context(self) -> list[dict[str, str]]:
         entries = []
@@ -1537,13 +1467,14 @@ class Orchestrator:
             evidence = None
             if finding.evidence_ids:
                 evidence = self._repos.evidence.get(finding.evidence_ids[0])
+            # Keep confirmed findings as a stable record type. Do not infer a
+            # generic "path" type from finding wording; specialized facts use
+            # only the explicit injection/credential classifications below.
             text = f"{finding.category} {finding.title}".lower()
             if "injection" in text:
                 kind = "injection_point"
             elif any(word in text for word in ("credential", "auth", "login", "session", "password")):
                 kind = "credential"
-            elif any(word in text for word in ("path", "directory", "endpoint", "exposure", "file")):
-                kind = "path"
             else:
                 kind = "confirmed_finding"
             entries.append(

@@ -27,6 +27,7 @@ class StrictModel(BaseModel):
 
 class TaskKind(str, Enum):
     PLAN = "plan"
+    SUPERVISE = "supervise"
     RECON = "recon"
     ANALYZE = "analyze"
     EXPLOIT = "exploit"
@@ -37,8 +38,13 @@ class TaskKind(str, Enum):
 
 
 class Role(str, Enum):
-    PLANNER = "planner"
+    # SYSTEM handles deterministic harness tasks (audit/report) without an LLM.
+    SYSTEM = "system"
     PENTESTER = "pentester"
+    SUPERVISOR = "supervisor"
+
+    # Retained so historical database rows remain readable.
+    PLANNER = "planner"
     REVIEWER = "reviewer"
     AUDITOR = "auditor"
     REPORTER = "reporter"
@@ -260,6 +266,20 @@ class PentesterOutput(StrictModel):
     findings: list[ProposedFinding] = Field(default_factory=list)
     tool_requests: list[ToolRequest] = Field(default_factory=list)
     notes: str = ""
+
+
+class SupervisorDirective(StrictModel):
+    slot: int = Field(ge=1, le=4)
+    objective: str = Field(min_length=20, max_length=800)
+    focus: list[str] = Field(default_factory=list, max_length=5)
+    avoid: list[str] = Field(default_factory=list, max_length=5)
+    guidance: str = Field(default="", max_length=600)
+
+
+class SupervisorOutput(StrictModel):
+    summary: str = Field(max_length=800)
+    assignments: list[SupervisorDirective] = Field(default_factory=list, max_length=4)
+    overlap_warnings: list[str] = Field(default_factory=list, max_length=8)
 
 
 class ReviewVerdictItem(StrictModel):
